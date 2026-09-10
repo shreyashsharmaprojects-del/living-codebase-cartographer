@@ -1,10 +1,26 @@
-# Living Codebase Cartographer
+# Living Codebase Cartographer — offline codebase map, dependency graph & impact analysis (no LSP, no cloud)
+
+> **Map any codebase offline in seconds: endpoints, call graphs, data lineage,
+> blast-radius (impact) analysis, and request-flow tracing — with evidence +
+> confidence on every fact. Zero dependencies, zero network calls, zero
+> telemetry.** Python stdlib only, works without an LSP or language server,
+> generates a portable offline HTML architecture explorer that opens over
+> `file://`.
 
 A **language-agnostic, framework-agnostic living codebase intelligence system**.
 It builds and maintains a machine-readable map of any software repository —
-symbols, endpoints, data stores, dependencies, call edges — with
-evidence + confidence on every fact, and keeps it synchronized as the code
-evolves.
+symbols, API endpoints, call graphs, data stores, dependencies, call edges —
+with evidence + confidence on every fact, and keeps it synchronized as the
+code evolves. Think: an **offline alternative** to cloud code-graph tools, an
+**AI-agent skill for repo mapping**, and a **standalone static-analysis CLI**
+in one package.
+
+**Keywords:** codebase map generator, repository mapping tool, static code
+analysis python, offline code intelligence, dependency graph visualizer,
+call-graph generator, blast-radius / impact analysis, API endpoint inventory,
+data-lineage tracker, architecture explorer, monorepo documentation generator,
+AI coding-assistant skill, DeepSeek / Claude / agentic-coding skill, no-LSP
+code navigation, `file://` HTML code browser.
 
 Supported out of the box: Java, TypeScript/JavaScript, Python, Go, C#, Rust,
 SQL (any DDL dialect), manifests/config/CI (generic), plus a LOW-confidence
@@ -107,3 +123,39 @@ python3 tests/run_viz_tests.py    # 81 checks
 See `analyzers/README.md` — implement `NAME/KIND/EXTENSIONS/can_handle/scan`,
 register in `analyzers/__init__.py`, add fixtures to `tests/run_tests.py`.
 Emit same-file HIGH `calls` edges so `flow`/`impact` work on your stack.
+
+## FAQ — is this what you're looking for?
+
+**A DeepSeek skill for codebase mapping?**
+Yes — this repo ships a `SKILL.md` agent manual plus a deterministic scanner,
+built for agentic-coding loops (DeepSeek, Claude, or any tool-using LLM):
+`status` → `query`/`impact`/`flow` → read source → answer with evidence links.
+It also works fully standalone with no AI involved.
+
+**A codebase cartographer / repo-map generator?**
+That's the core job: `init` scans any repo into `graph.json` (nodes + edges +
+evidence + confidence), `sync` keeps it fresh incrementally, `visualize`
+renders it as an interactive map.
+
+**A standalone offline tool (no cloud, no LSP, no telemetry)?**
+Yes. Python 3.8+ stdlib only — no `pip install`, no language server, no
+network calls, no telemetry, no build step. The HTML explorer opens directly
+over `file://`. Air-gapped environments welcome.
+
+**A dependency-graph / call-graph visualizer?**
+Yes — nine graph modes (architecture, dependency, call-graph, data-flow, api,
+database, external, impact, flow) plus eight structured views (Overview,
+Endpoints, Data, Dependencies, Symbols, Flows, Graph, Issues), with
+left-to-right layered layout, confidence-encoded edges, and editor deep-links.
+
+**An impact-analysis / blast-radius tool?**
+Yes — `impact <Symbol>` computes reverse-reachability (callers, consumers,
+entry points) before you change code; `flow --from A --to B` traces request
+paths from frontend through API, logic, and data layers.
+
+**Which languages are supported?**
+Java, TypeScript/JavaScript (incl. React/Vue patterns), Python
+(FastAPI/Flask/Django/Celery), Go (HTTP/gRPC/Kafka), C# (ASP.NET/gRPC),
+Rust, SQL DDL dialects, manifests/config/CI — plus a LOW-confidence fallback
+pass for anything else (Ruby, PHP, Kotlin, Swift, …). The schema itself is
+closed and technology-independent, so new languages plug in as analyzers.
