@@ -173,8 +173,33 @@ def generate(root, map_dir=C.DEFAULT_MAP_DIR, mode="architecture",
             changes.append({"file": nm, "title": title[:120]})
     except OSError:
         changes = []
+    # Curated business-flows/ (read-only VIEW input, never a second source
+    # of truth): <name>.md files with `node: <id>` evidence links become
+    # curated flows shown first in the Flows view. _candidates.md skipped.
+    curated_flows = []
+    try:
+        bfdir = os.path.join(paths["dir"], "business-flows")
+        for nm in sorted(os.listdir(bfdir)):
+            if not nm.endswith(".md") or nm == "_candidates.md":
+                continue
+            ap = os.path.join(bfdir, nm)
+            with open(ap, encoding="utf-8") as fh:
+                text = fh.read()
+            chain = []
+            for ln in text.splitlines():
+                ln = ln.strip()
+                if ln.lower().startswith("node:"):
+                    cid = ln.split(":", 1)[1].strip().strip("`\"' ")
+                    if cid:
+                        chain.append(cid)
+            if chain:
+                curated_flows.append({"seed": nm[:-3], "kind": "curated",
+                                      "source": "business-flows/" + nm,
+                                      "chain": chain})
+    except OSError:
+        curated_flows = []
     extra = {"stale": fresh["changed"][:15] if fresh.get("stale") else [],
-             "changes": changes}
+             "changes": changes, "curated_flows": curated_flows}
     view = V.build_view_model(
         graph,
         focus=(sorted(focus_ids) if focus_ids else None),

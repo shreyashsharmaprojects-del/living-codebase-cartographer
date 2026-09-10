@@ -40,8 +40,10 @@ MODES = ("architecture", "dependency", "call-graph", "data-flow", "api",
 
 # First-class structured views (primary nav). "graph" hosts the canvas +
 # MODES above; the rest are sortable/filterable tables over the same model.
+# "capabilities" is the Wave-4a intent-layer peer (capability -> requirements
+# -> realizing code -> test coverage); empty when no intent was imported.
 VIEWS = ("overview", "endpoints", "data", "dependencies", "symbols",
-         "flows", "graph", "issues")
+         "flows", "capabilities", "graph", "issues")
 
 # Layered (Sugiyama-style) graph roles, left-to-right. Technology identity
 # never leaks into layers: mapping is by generic kind only.
@@ -98,8 +100,19 @@ def _kind_rank(kind):
     return KIND_RANK.get(kind, 50)
 
 
-def project_node(n, degree):
+def layer_for_kind(kind, fallback_layer=None):
+    """Architectural-role layer; unmappable kinds take the deterministic
+    longest-path fallback (or middle 'services') — never random."""
+    if kind in LAYER_OF:
+        return LAYER_OF[kind]
+    if fallback_layer is not None:
+        return LAYERS[min(len(LAYERS) - 1, max(0, fallback_layer))]
+    return "services"
+
+
+def project_node(n, degree, fallback_layers=None):
     meta = n.get("meta") or {}
+    fb = (fallback_layers or {}).get(n["id"])
     return {
         "id": n["id"],
         "label": n.get("name") or n["id"],
@@ -107,7 +120,7 @@ def project_node(n, degree):
         "lang": meta.get("lang"),
         "fw": meta.get("framework"),
         "group": group_of(n),
-        "layer": LAYER_OF.get(n.get("kind"), "services"),
+        "layer": layer_for_kind(n.get("kind"), fb),
         "file": n.get("file"),
         "line": n.get("line"),
         "conf": n.get("confidence", "UNKNOWN"),
@@ -331,7 +344,27 @@ def build_view_model(graph, focus=None, impact=None, flow=None,
         if focus_set else {"nodes": [], "edges": []})
     modes["flow"] = modes["impact"]
 
-    vnodes = [project_node(by_id[nid], degree.get(nid, 0)) for nid in touched]
+    # longest-path fallback layers for kinds with no role mapping
+    # (deterministic: sorted-order BFS from entry seeds, quantized 0..5).
+    _fb = {}
+    _seeds = sorted(nid for nid, n in keep.items()
+                    if n.get("kind") in ENTRY_KINDS)
+    _dist = {nid: 0 for nid in _seeds}
+    _front = sorted(_seeds)
+    while _front:
+        _nxt = []
+        for _fid in _front:
+            for _e in outgoing.get(_fid, []):
+                _d = _e.get("dst")
+                if _d in keep and _d not in _dist:
+                    _dist[_d] = _dist[_fid] + 1
+                    _nxt.append(_d)
+        _front = sorted(set(_nxt))
+    for nid, n in keep.items():
+        if n.get("kind") not in LAYER_OF:
+            _fb[nid] = min(5, _dist.get(nid, 6) // 2 if nid in _dist else 3)
+    vnodes = [project_node(by_id[nid], degree.get(nid, 0),
+                           fallback_layers=_fb) for nid in sorted(touched)]
     search = [{"id": n["id"], "label": n["label"], "kind": n["kind"],
                "lang": n["lang"], "file": n["file"]}
               for n in sorted(vnodes, key=lambda n: n["label"].lower())]
@@ -401,6 +434,7 @@ def build_tables(graph, by_id, outgoing, incoming, degree, extra=None):
                 "deg": degree.get(n["id"], 0)}
 
     # ---- endpoints: method/path/handler/file:line/confidence/consumers
+    # + downstream reach (bounded BFS over outgoing edges)
     endpoints = []
     for n in nodes:
         if n.get("kind") not in ENTRY_KINDS:
@@ -420,14 +454,35 @@ def build_tables(graph, by_id, outgoing, incoming, degree, extra=None):
                           "file": n.get("file"), "line": n.get("line"),
                           "conf": n.get("confidence", "UNKNOWN"),
                           "consumers": consumers[:10],
-                          "n_consumers": len(consumers)})
+                          "n_consumers": len(consumers),
+                          "reach": _downstream_reach(
+                              n["id"], outgoing, by_id, limit=400)})
 
-    # ---- data: tables + readers/writers
+    # ---- data: tables + readers/writers + migrations
+    # Columns: the graph carries no column/field nodes, so every store row
+    # states that explicitly rather than showing a misleading empty column.
     data_kinds = ("table", "view", "collection", "entity", "database")
     tables, access = [], []
     for n in nodes:
         if n.get("kind") in data_kinds:
-            tables.append(row(n))
+            r = row(n)
+            r["columns"] = sorted(
+                (n.get("meta") or {}).get("columns") or [])
+            tables.append(r)
+    migrations = []
+    for n in nodes:
+        if n.get("kind") == "migration":
+            for e in outgoing.get(n["id"], []):
+                if e.get("dst") in by_id and by_id[e["dst"]].get("kind") \
+                        in data_kinds:
+                    migrations.append(
+                        {"migration": n.get("name") or n["id"],
+                         "migration_id": n["id"],
+                         "table": e["dst"],
+                         "file": n.get("file"), "line": n.get("line"),
+                         "conf": n.get("confidence", "UNKNOWN")})
+    migrations = sorted(migrations,
+                        key=lambda m: (m["table"], m["migration"]))
     for e in edges:
         if e.get("type") in ("reads", "writes", "queries", "creates",
                               "modifies", "seeds", "transforms"):
@@ -442,18 +497,25 @@ def build_tables(graph, by_id, outgoing, incoming, degree, extra=None):
     access = sorted([a for a in access if a["table"] in store_ids],
                     key=lambda a: (a["table"], a["op"], a["actor"]))
 
-    # ---- dependencies: external grouped by manifest (edge/config file)
+    # ---- dependencies: external grouped by manifest (edge/config file).
+    # Version comes only from node meta (never parsed here); importing
+    # files come from the depends-on/imports edges into each service.
     dependencies = []
     for n in nodes:
         if n.get("kind") != "external-service":
             continue
-        manifests = sorted({e.get("file") or "" for e in
-                            incoming.get(n["id"], [])
-                            if e.get("type") == "depends-on"})
+        meta = n.get("meta") or {}
+        dep_edges = [e for e in incoming.get(n["id"], [])
+                     if e.get("type") in ("depends-on", "imports")]
+        manifests = sorted({e.get("file") or "" for e in dep_edges})
+        importing = sorted({e["src"] for e in dep_edges})
         dependencies.append({"id": n["id"], "label": n.get("name"),
                              "manifest": manifests[0] if manifests else
                              (n.get("file") or ""),
                              "manifests": manifests,
+                             "version": meta.get("version"),
+                             "importing": importing[:15],
+                             "n_importing": len(importing),
                              "file": n.get("file"), "line": n.get("line"),
                              "conf": n.get("confidence", "UNKNOWN")})
     dependencies.sort(key=lambda d: (d["manifest"] or "", d["label"] or ""))
@@ -464,8 +526,25 @@ def build_tables(graph, by_id, outgoing, incoming, degree, extra=None):
     symbols = {"total": len(sym_rows),
                "rows": sym_rows[:SYMBOL_ROW_CAP]}
 
-    # ---- flows: ordered steps with evidence (file:line per step)
+    # ---- flows: curated business-flows/ first, then tool candidates.
+    # Curated files are read-only VIEW input via extra["curated_flows"]
+    # (viz_gen reads business-flows/*.md); without them the section is
+    # candidates only and says so (never presented as curated).
     flows = []
+    curated = extra.get("curated_flows", []) or []
+    for f in curated:
+        steps = []
+        for sid in f.get("chain", []) or []:
+            n = by_id.get(sid)
+            steps.append({"id": sid, "label": n.get("name") if n else sid,
+                          "kind": n.get("kind") if n else None,
+                          "file": n.get("file") if n else None,
+                          "line": n.get("line") if n else None,
+                          "missing": n is None})
+        flows.append({"seed": f.get("seed"), "kind": f.get("kind"),
+                      "curated": True, "source": f.get("source"),
+                      "steps": steps, "complete": all(not s["missing"]
+                                                     for s in steps)})
     for f in graph.get("flow_candidates", []) or []:
         steps = []
         for sid in f.get("chain", []) or []:
@@ -476,6 +555,7 @@ def build_tables(graph, by_id, outgoing, incoming, degree, extra=None):
                           "line": n.get("line") if n else None,
                           "missing": n is None})
         flows.append({"seed": f.get("seed"), "kind": f.get("kind"),
+                      "curated": False,
                       "steps": steps, "complete": all(not s["missing"]
                                                      for s in steps)})
 
@@ -562,9 +642,130 @@ def build_tables(graph, by_id, outgoing, incoming, degree, extra=None):
         "recent": extra.get("changes", [])[:15],
     }
     return {"overview": overview, "endpoints": endpoints, "data": {
-        "tables": tables, "access": access},
+        "tables": tables, "access": access, "migrations": migrations},
         "dependencies": dependencies, "symbols": symbols, "flows": flows,
+        "capabilities": _capabilities_table(nodes, edges, by_id),
         "issues": issues}
+
+
+def _capabilities_table(nodes, edges, by_id):
+    """Intent-layer tree: capability -> requirements -> realizing code.
+
+    Pure projection over ASSERTED intent nodes/edges (Wave 4a contract):
+    ids `intent:<kind>:<slug>`, provenance "asserted", confidence null.
+    Per-requirement status: realized (has realizing code) / unbound /
+    stale (a binding edge carries review=needs-review). Empty list when
+    no intent was imported — the UI renders the honest empty state.
+    Every row carries file/line for inspector + editor links."""
+    intent_kinds = {"capability", "requirement", "concept", "slice",
+                    "decision", "non-goal"}
+    inodes = {n["id"]: n for n in nodes
+              if n.get("kind") in intent_kinds
+              or str(n.get("id", "")).startswith("intent:")}
+    if not inodes:
+        return []
+    realized_by = {}   # req/cap id -> [code node ids]
+    code_why = {}      # code id -> [(intent id, why text)]
+    stale_ids = set()
+    req_of_cap = {}    # cap id -> [req ids]
+    for e in edges:
+        t = e.get("type")
+        if t == "realizes" and e.get("dst") in inodes:
+            realized_by.setdefault(e["dst"], []).append(e["src"])
+            meta = e.get("meta") or {}
+            code_why.setdefault(e["src"], []).append(
+                (e["dst"], meta.get("why", "")))
+            if meta.get("review") == "needs-review":
+                stale_ids.add(e["dst"])
+                stale_ids.add(e["src"])
+        elif t == "part-of" and e.get("src") in inodes \
+                and e.get("dst") in inodes:
+            src_k = inodes[e["src"]].get("kind")
+            if src_k == "requirement":
+                req_of_cap.setdefault(e["dst"], []).append(e["src"])
+    caps = []
+    for nid, n in inodes.items():
+        if n.get("kind") != "capability":
+            continue
+        reqs = []
+        for rid in sorted(req_of_cap.get(nid, [])):
+            r = inodes.get(rid, {})
+            rmeta = r.get("meta") or {}
+            code = sorted(set(realized_by.get(rid, [])))
+            stale = rid in stale_ids
+            status = "stale" if stale else (
+                "realized" if code else "unbound")
+            code_rows = []
+            for c in code:
+                bn = by_id.get(c) or {}
+                why = ""
+                for iid, w in code_why.get(c, []):
+                    if iid == rid:
+                        why = w
+                        break
+                code_rows.append({"id": c, "label": bn.get("name", c),
+                                  "kind": bn.get("kind"),
+                                  "file": bn.get("file"),
+                                  "line": bn.get("line"), "why": why})
+            reqs.append({
+                "id": rid, "title": r.get("name") or rid,
+                "status": status,
+                "asserted_by": rmeta.get("author"),
+                "asserted_at": rmeta.get("asserted_at"),
+                "source": rmeta.get("source"),
+                "code": code_rows,
+            })
+        caps.append({
+            "id": nid, "title": n.get("name") or nid,
+            "status": (n.get("meta") or {}).get("status", "active"),
+            "requirements": reqs,
+        })
+    caps.sort(key=lambda c: c["id"])
+    return caps
+
+
+def _downstream_reach(nid, outgoing, by_id, limit=400):
+    """Count of nodes reachable downstream (bounded BFS, deterministic)."""
+    seen = {nid}
+    frontier = [nid]
+    while frontier and len(seen) < limit:
+        nxt = []
+        for fid in sorted(frontier):
+            for e in outgoing.get(fid, []):
+                dst = e.get("dst")
+                if dst in by_id and dst not in seen:
+                    seen.add(dst)
+                    nxt.append(dst)
+                    if len(seen) >= limit:
+                        break
+            if len(seen) >= limit:
+                break
+        frontier = nxt
+    return len(seen) - 1
+
+
+def longest_path_layer(nid, outgoing, layer_of_fn, memo, visiting=None):
+    """Fallback layer for kinds with no architectural mapping: longest-path
+    depth from entry-point seeds, quantized onto the LAYERS axis. Pure +
+    deterministic (iteration in sorted id order; cycles clamp at depth 6).
+    ( viz_gen / tests can call this for unmappable kinds. )"""
+    if nid in memo:
+        return memo[nid]
+    visiting = visiting or set()
+    if nid in visiting:
+        return 3  # cycle: middle layer, deterministic
+    visiting.add(nid)
+    best = 0
+    for e in sorted(outgoing.get(nid, []), key=lambda e: e.get("dst", "")):
+        dst = e.get("dst")
+        if dst is None:
+            continue
+        best = max(best, 1 + longest_path_layer(
+            dst, outgoing, layer_of_fn, memo, visiting))
+    visiting.discard(nid)
+    layer = min(5, max(0, best // 2)) if best else 3
+    memo[nid] = layer
+    return layer
 
 
 def _mode(keep, outgoing, incoming, by_id, edge_types, kinds,

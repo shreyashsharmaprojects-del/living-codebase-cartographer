@@ -138,8 +138,7 @@ function rebuild(){
   // Loading veil: force layout on large views blocks the main thread, so
   // show the veil first and yield a frame before the heavy work. Without
   // the yield the browser never paints the veil (and the canvas keeps its
-  // stale frame, which looked like "mode buttons do nothing"). Heavy work
-  // is chunked (layoutSlice) so no main-thread block exceeds ~100ms.
+  // stale frame, which looked like "mode buttons do nothing").
   const veil=$("veil");
   if(veil){
     const vm=$("veilmsg");
@@ -153,6 +152,7 @@ function rebuild(){
   else setTimeout(run,0);
 }
 function rebuildNow(){
+  S._containers = [];  // stale header boxes must never intercept clicks
   let v;
   if(S.sel && NODES[S.sel]) v = focusView(S.sel, S.depth);
   else if(S.mode==="architecture" && !S.group) v = groupViewNodes();
@@ -166,6 +166,15 @@ function rebuildNow(){
   else v = rawModeView(S.mode);
   // Focus mode removes the non-neighbourhood from the layout entirely:
   // focusView already returns only the neighbourhood (not a fade).
+  // Header-folded groups leave every layout the same way.
+  if(S.view==="graph" && Object.keys(S.folded).length){
+    const cut = new Set(Object.keys(S.folded));
+    v = {nodes: v.nodes.filter(n=>n.kind==="__group__"||!cut.has(n.group)),
+         edges: v.edges.filter(e=>{
+           const a=NODES[e.s], b=NODES[e.t];
+           return !(a&&cut.has(a.group)) && !(b&&cut.has(b.group));
+         })};
+  }
   v = capView(v);
   S.nodes=v.nodes; S.edges=v.edges;
   const vm=$("veilmsg");
@@ -233,14 +242,20 @@ function layoutLayered(){
     });
   }
   // --- position: x = column, y = centred order; deterministic jitter
-  // breaks exact overlaps of same-barycentre nodes
+  // breaks exact overlaps of same-barycentre nodes. Narrow viewports
+  // (<720px canvas) transpose: layers run top-to-bottom instead of L-to-R.
+  const gp = (typeof document!=="undefined") && $("graphpane");
+  const narrow = gp && gp.clientWidth > 0 && gp.clientWidth < 720;
+  S.narrow = !!narrow;
   const maxRows = Math.max(...cols.map(c=>c.length), 1);
   cols.forEach((col,c)=>{
     col.forEach((x,i)=>{
       x._r = nodeR(x);
-      x._x = c * LAYER_X_GAP;
-      x._y = (i - (col.length-1)/2) * LAYER_Y_GAP
+      const px = c * LAYER_X_GAP;
+      const py = (i - (col.length-1)/2) * LAYER_Y_GAP
         + ((hashStr(x.id) % 100)-50)/50 * 7;
+      x._x = narrow ? py : px;
+      x._y = narrow ? px : py;
       x._col = c; x._row = i;
     });
   });
@@ -402,18 +417,53 @@ function draw(){
 function drawLayers(W,H){
   if(S.mode==="architecture"&&!S.sel&&!S.group) return;
   if(!S.layerCols || !S.layerCols.length) return;
-  // column label strip (layer names left-to-right)
+  // column label strip (layer names left-to-right, top-to-bottom narrow)
   ctx.font="12px "+FONT; ctx.textAlign="left";
   const cols = S.layerCols;
   cols.forEach((col,c)=>{
     if(!col.length) return;
     const a=S.byId[col[0]];
     if(!a) return;
-    const [sx]=w2s(a._x,0);
     ctx.fillStyle="#5b6572";
-    ctx.fillText(layerName(c), Math.max(8,sx-70), 18);
+    if(S.narrow){
+      const [,sy]=w2s(0,a._y);
+      ctx.fillText(layerName(c), 8, Math.max(14,sy-8));
+    } else {
+      const [sx]=w2s(a._x,0);
+      ctx.fillText(layerName(c), Math.max(8,sx-70), 18);
+    }
   });
-  // module container outlines (non-collapsed detail groups)
+  // real container boundaries: rounded outline + label per group with
+  // 2+ members on screen. Clicking a header folds that group (its
+  // members leave the layout; the architecture ring shows the summary).
+  S._containers = [];
+  const seen = {};
+  S.nodes.forEach(x=>{
+    if(x.kind==="__group__") return;
+    const g = x.group;
+    if(!g || S.folded[g]) return;  // header-folded: leave layout entirely
+    (seen[g]=seen[g]||[]).push(x);
+  });
+  Object.keys(seen).forEach(g=>{
+    const ms = seen[g].filter(x=>isFinite(x._x)&&isFinite(x._y));
+    if(ms.length<2) return;
+    let x0=1e18,y0=1e18,x1=-1e18,y1=-1e18;
+    ms.forEach(x=>{x0=Math.min(x0,x._x-x._r);y0=Math.min(y0,x._y-x._r);
+      x1=Math.max(x1,x._x+x._r);y1=Math.max(y1,x._y+x._r);});
+    const [sx0,sy0]=w2s(x0,y0), [sx1,sy1]=w2s(x1,y1);
+    const pad=14;
+    ctx.strokeStyle="rgba(88,166,255,0.35)"; ctx.lineWidth=1.2;
+    ctx.setLineDash([6,4]);
+    ctx.beginPath();
+    if(ctx.roundRect) ctx.roundRect(sx0-pad,sy0-pad-16,sx1-sx0+pad*2,sy1-sy0+pad*2+16,8);
+    else ctx.rect(sx0-pad,sy0-pad-16,sx1-sx0+pad*2,sy1-sy0+pad*2+16);
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle="#8b9eb5"; ctx.font="12px "+FONT; ctx.textAlign="left";
+    const label = g+" ("+ms.length+") — click header to fold";
+    ctx.fillText(label.slice(0,48), sx0-pad+4, sy0-pad-4);
+    S._containers.push({g, sx:sx0-pad, sy:sy0-pad-16,
+      w:sx1-sx0+pad*2, h:sy1-sy0+pad*2+16});
+  });
   ctx.textAlign="left";
 }
 function layerName(c){

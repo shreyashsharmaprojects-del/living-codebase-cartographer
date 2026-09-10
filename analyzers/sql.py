@@ -41,6 +41,23 @@ DROP_RE = re.compile(
 ADD_COL_RE = re.compile(
     r"ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?([\"']?)([\w]+)\1",
     re.IGNORECASE)
+# DML table refs: FROM/JOIN read, UPDATE/DELETE write. Same
+# (quote, name) group shape as ALTER_RE so _tail_name(text, m, 2) applies.
+FROM_RE = re.compile(
+    r"FROM\s+(?:ONLY\s+)?([\"']?)([\w.]+)\1", re.IGNORECASE)
+JOIN_RE = re.compile(
+    r"JOIN\s+(?:ONLY\s+)?([\"']?)([\w.]+)\1", re.IGNORECASE)
+UPDATE_RE = re.compile(
+    r"UPDATE\s+(?:ONLY\s+)?([\"']?)([\w.]+)\1", re.IGNORECASE)
+DELETE_RE = re.compile(
+    r"DELETE\s+FROM\s+(?:ONLY\s+)?([\"']?)([\w.]+)\1", re.IGNORECASE)
+# Grammar words that can follow FROM/JOIN/UPDATE positionally in odd but
+# valid syntax (or via \s spanning a line break); never table names.
+_DML_STOPWORDS = frozenset({
+    "select", "where", "set", "values", "order", "group", "limit",
+    "offset", "returning", "on", "using", "lateral", "left", "right",
+    "inner", "outer", "full", "cross", "natural",
+})
 _IDENT_RE = re.compile(
     r'"([^"]+)"|\'([^\']+)\'|`([^`]+)`|\[([^\]]+)\]|([\w]+)')
 _CONSTRAINT_WORDS = frozenset({
@@ -200,11 +217,20 @@ def scan(ctx, path, text):
         nodes[nid] = ctx.node(nid, nkind, name, line, "HIGH", meta)
         ctx.edge(mid, nid, "creates", line, "HIGH", {})
         ctx.edge(fid, nid, "defines", line, "HIGH", {})
+    # DROP carries op:drop on a `modifies` edge, which add_edge dedupes
+    # against ALTER's plain `modifies` edge for the same table, so ALTER
+    # yields to DROP here (the drop is the terminal op).
+    drop_names = set()
+    for _sm in DROP_RE.finditer(text):
+        _dn, _ = _tail_name(text, _sm, 3)
+        if _dn:
+            drop_names.add(_dn)
     for sm in ALTER_RE.finditer(text):
         name, end = _tail_name(text, sm, 2)
         line = text[:sm.start()].count("\n") + 1
-        ctx.edge(mid, _sid(f"table:{name}"), "modifies", line, "HIGH",
-                 {"dialect": dialect})
+        if name not in drop_names:
+            ctx.edge(mid, _sid(f"table:{name}"), "modifies", line, "HIGH",
+                     {"dialect": dialect})
         # ALTER ... ADD COLUMN enriches this file's own table node only;
         # nodes owned by other files are never mutated.
         nid = _sid(f"table:{name}")
@@ -226,6 +252,27 @@ def scan(ctx, path, text):
         line = text[:sm.start()].count("\n") + 1
         ctx.edge(mid, _sid(f"table:{name}"), "seeds", line, "MEDIUM",
                  {"dialect": dialect})
+    # DML reads/writes: target bare `table:` ids (placeholders when no
+    # table node exists in the graph — resolve-time membership check).
+    # DROP carries op:drop on a `modifies` edge, which add_edge dedupes
+    # against ALTER's plain `modifies` edge for the same table, so ALTER
+    # yields to DROP here (the drop is the terminal op).
+    seen_rw = set()
+    _dml = ([(sm, "reads") for sm in FROM_RE.finditer(text)] +
+            [(sm, "reads") for sm in JOIN_RE.finditer(text)] +
+            [(sm, "writes") for sm in UPDATE_RE.finditer(text)] +
+            [(sm, "writes") for sm in DELETE_RE.finditer(text)])
+    for sm, etype in _dml:
+        name, _ = _tail_name(text, sm, 2)
+        if not name or name in _DML_STOPWORDS:
+            continue
+        key = (name, etype)
+        if key in seen_rw:
+            continue
+        seen_rw.add(key)
+        line = text[:sm.start()].count("\n") + 1
+        ctx.edge(mid, _sid(f"table:{name}"), etype, line, "MEDIUM",
+                 {"dialect": dialect, "via": "sql-dml"})
     for sm in DROP_RE.finditer(text):
         kind_word = sm.group(1).upper()
         if kind_word == "INDEX":

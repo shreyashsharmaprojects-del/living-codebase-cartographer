@@ -81,7 +81,11 @@ python3 $CARTO/scripts/cartographer.py <cmd>
 | `map-flow` | `... cartographer.py flow --from <A> --to <B>` | Trace a path between two symbols/endpoints. |
 | `map-validate` | `... cartographer.py validate` | Integrity + generic-schema conformance check. |
 | `map-detect` | `... cartographer.py detect` | Show the detected stack (`stack.md`). |
-| `map-visualize` | `... cartographer.py visualize [--kind M] [--symbol S] [--impact S] [--flow F] [--open] [--serve]` | Generate interactive HTML architecture explorer (8 views: Overview, Endpoints, Data, Dependencies, Symbols, Flows, Graph, Issues — read-only view over `graph.json`). |
+| `map-visualize` | `... cartographer.py visualize [--kind M] [--symbol S] [--impact S] [--flow F] [--open] [--serve]` | Generate interactive HTML architecture explorer (9 views: Overview, Endpoints, Data, Dependencies, Symbols, Flows, Capabilities, Graph, Issues — read-only view over `graph.json`). |
+| `map-intent-import` | `... cartographer.py intent import` | Parse `docs/requirements.md`, `plan.md`, `decisions.md` into ASSERTED intent nodes (idempotent). |
+| `map-intent-bind` | `... cartographer.py intent bind --slice S --realizes R --nodes N,... --why "..."` | Attach code nodes to intent nodes (programmatic write path). |
+| `map-why` | `... cartographer.py why <node>` | Reverse lookup: which requirements/slices/decisions claim this code. |
+| `map-responsible-for` | `... cartographer.py responsible-for <intent-id>` | Forward lookup: every code node realizing a requirement/capability. |
 
 There are no slash-command wrappers to install: invoke the skill (`/living-codebase-cartographer`
 or the `skill` tool), then run the operation above and interpret the output.
@@ -124,8 +128,8 @@ nodes, no-evidence entries, ID sanity, and **generic-schema conformance**.
 
 Read-only browser view over `graph.json` (never a second source of truth):
 `.codebase-map/visualization/index.html` + `data/graph.js` + `data/boot.js`.
-Offline, no CDN/telemetry; works over `file://`. Eight views (Overview,
-Endpoints, Data, Dependencies, Symbols, Flows, Graph, Issues); graph modes
+Offline, no CDN/telemetry; works over `file://`. Nine views (Overview,
+Endpoints, Data, Dependencies, Symbols, Flows, Capabilities, Graph, Issues); graph modes
 include architecture (grouped), dependency, call-graph, data-flow, api,
 database, external, impact, flow. Examples:
 

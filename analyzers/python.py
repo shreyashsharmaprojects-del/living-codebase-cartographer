@@ -2,8 +2,15 @@
 
 Generic output: function/method, class/interface, endpoint (REST decorators),
 handler (message/CLI), job (scheduled), table (ORM), configuration.
+
+Primary pass parses with stdlib ``ast`` (deterministic: imports, class/def
+structure, call sites, SQL/ORM usage come from node visits, so the
+import-newline bug class cannot occur). Files that do not parse (py2
+sources, fragments) fall back to the legacy line/regex scan and record a
+scan error via ``ctx.scan_error`` — a single file never raises.
 """
 
+import ast
 import re
 
 NAME = "python"
@@ -15,8 +22,37 @@ PRIORITY = 10
 
 LANG = "python"
 
-CLASS_RE= re.compile(r"^\s*class\s+(\w+)\s*(?:\(([^)]*)\))?\s*:", re.M)
-FUNC_RE= re.compile(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(", re.M)
+# ---------------------------------------------------------------------------
+# Shared value analysis (operates on AST string-constant values, never on
+# raw source lines, so newlines inside literals are content, not structure)
+# ---------------------------------------------------------------------------
+SQL_VERB_RE = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
+SQL_TABLE_RE = re.compile(
+    r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+([A-Za-z_][\w]*)",
+    re.IGNORECASE)
+SQL_SKIP_WORDS = frozenset({
+    "select", "where", "set", "values", "order", "group", "by", "and",
+    "or", "on", "as", "limit", "having", "offset"})
+
+# DB-call surface shared by both passes.
+SQL_DOTTED_SINKS = frozenset({"execute", "executemany", "raw", "query"})
+SQL_BARE_SINKS = frozenset({"text", "createQuery", "create_query"})
+
+# ---------------------------------------------------------------------------
+# Line-local textual patterns (kept as regex in BOTH passes: single-line,
+# no newline-spanning character class — safe by audit)
+# ---------------------------------------------------------------------------
+HTTP_CALL_RE = re.compile(
+    r"""\b(?:requests|httpx|aiohttp|urllib)\s*\.\s*(get|post|put|delete|patch)\s*\(\s*["']([^"']+)["']""")
+MONGO_RE = re.compile(r"""\.\s*(?:get_collection|Collection)\s*\(\s*["']([\w-]+)["']""")
+REDIS_RE = re.compile(
+    r"""\bredis\w*\s*\.\s*(get|set|hget|hset|lpush|rpush|publish|expire)\s*\(""")
+
+# ---------------------------------------------------------------------------
+# Legacy fallback regexes (SyntaxError path only)
+# ---------------------------------------------------------------------------
+CLASS_RE = re.compile(r"^\s*class\s+(\w+)\s*(?:\(([^)]*)\))?\s*:", re.M)
+FUNC_RE = re.compile(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(", re.M)
 FASTAPI_DEC = re.compile(
     r"@(?:app|router|api)\.(get|post|put|delete|patch|head|options)"
     r"""\s*\(\s*["']([^"']+)["']""")
@@ -35,11 +71,6 @@ IMPORT_RE = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.,\t ]+))"
                        re.M)
 IMPORT_SKIP = frozenset({
     "os", "sys", "re", "json", "datetime", "typing", "pathlib"})
-HTTP_CALL_RE = re.compile(
-    r"""\b(?:requests|httpx|aiohttp|urllib)\s*\.\s*(get|post|put|delete|patch)\s*\(\s*["']([^"']+)["']""")
-MONGO_RE = re.compile(r"""\.\s*(?:get_collection|Collection)\s*\(\s*["']([\w-]+)["']""")
-REDIS_RE = re.compile(
-    r"""\bredis\w*\s*\.\s*(get|set|hget|hset|lpush|rpush|publish|expire)\s*\(""")
 # Same-file call detection (mirrors java's same-class HIGH pattern):
 # pass 1 collects defined function/method names; pass 2 links call sites.
 CALL_RE = re.compile(r"\b([a-zA-Z_][\w]*)\s*\(")
@@ -57,16 +88,17 @@ SQL_SINK_RE = re.compile(
     r"\b(text|createQuery|create_query)\s*\(")
 STR_LIT_RE = re.compile(
     r"""[fFrRbBuU]{0,2}('((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)")""")
-SQL_VERB_RE = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
-SQL_TABLE_RE = re.compile(
-    r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+([A-Za-z_][\w]*)",
-    re.IGNORECASE)
-SQL_SKIP_WORDS = frozenset({
-    "select", "where", "set", "values", "order", "group", "by", "and",
-    "or", "on", "as", "limit", "having", "offset"})
 SESSION_QUERY_RE = re.compile(r"\.\s*query\s*\(\s*([A-Za-z_][\w]*)\s*\)")
 MODEL_QUERY_RE = re.compile(r"\b([A-Za-z_][\w]*)\.query\s*\.")
 DJANGO_MGR_RE = re.compile(r"\b([A-Za-z_][\w]*)\.objects\s*\.")
+
+# AST-pass decorator vocabularies (mirror the legacy decorator regexes).
+_DECO_SRC = ""
+_FASTAPI_OBJS = frozenset({"app", "router", "api"})
+_FASTAPI_METHODS = frozenset(
+    {"get", "post", "put", "delete", "patch", "head", "options"})
+_FLASK_OBJS = frozenset({"app", "bp", "blueprint"})
+_KNOWN_HTTP = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH"})
 
 
 def can_handle(path, text=None):
@@ -98,6 +130,444 @@ def _clean_id(s, limit=512):
         return None
     return s
 
+
+def _model_dst(model, class_names):
+    if model in class_names:
+        return f"py:class:{model}"
+    return f"unresolved:class:{model}"
+
+
+def _table_dst(ctx, name, file_tables):
+    """Literal-SQL table target.
+
+    ``table:<name>`` whenever the name matches the shared lowercase
+    convention (sql.py ``_tail_name`` lowercases; the python SQL value
+    analysis lowercases here) — the generic resolve/validate layer treats
+    a bare ``table:`` id as a placeholder only while no node with that id
+    exists (``graph.is_placeholder``), and as resolved once any analyzer
+    (e.g. a sql.py migration, scanned before or after this file) owns the
+    node. Otherwise ``unresolved:table:<name>``.
+    """
+    tid = _clean_id(name.lower())
+    if not tid:
+        return None
+    if tid in file_tables:
+        return f"table:{tid}"
+    # Bare table: ids resolve graph-wide at resolve time; unresolved only
+    # when the name itself is unusable as an id (handled above).
+    return f"table:{tid}"
+
+
+# ---------------------------------------------------------------------------
+# AST helpers (3.8-compatible: no ast.unparse)
+# ---------------------------------------------------------------------------
+
+def _dotted(node):
+    """Dotted name for Name/Attribute chains, else None."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted(node.value)
+        if base:
+            return base + "." + node.attr
+    return None
+
+
+def _is_str(node):
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _const_strs(node):
+    """String-constant fragments of an expression (f-strings contribute
+    their literal parts, matching the legacy literal join)."""
+    if _is_str(node):
+        return [node.value]
+    if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+        try:
+            return [node.value.decode("ascii")]
+        except Exception:
+            return []
+    if isinstance(node, ast.JoinedStr):
+        parts = [v.value for v in node.values if _is_str(v)]
+        return ["".join(parts)] if parts else []
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _const_strs(node.left) + _const_strs(node.right)
+    return []
+
+
+def _sql_literal_edges(ctx, src, frags, line, file_tables):
+    """DML verbs in sink string fragments -> reads/writes (MEDIUM) or a
+    LOW dynamic ``queries`` edge when the verb is seen but no table is
+    recoverable. No verb -> no edge (same rule as the legacy pass)."""
+    text = " ".join(f for f in frags if f)
+    vm = SQL_VERB_RE.search(text)
+    if not vm:
+        return
+    verb = vm.group(1).upper()
+    etype = "reads" if verb == "SELECT" else "writes"
+    seen, tables = set(), []
+    for t in SQL_TABLE_RE.findall(text):
+        if t.lower() in SQL_SKIP_WORDS or t.lower() in seen:
+            continue
+        seen.add(t.lower())
+        tables.append(t)
+    if tables:
+        for t in tables:
+            dst = _table_dst(ctx, t, file_tables)
+            if not dst:
+                continue
+            ctx.edge(src, dst, etype, line, "MEDIUM",
+                     {"via": "sql-literal", "lang": LANG})
+    else:
+        ctx.edge(src, "unresolved:query:dynamic", "queries", line,
+                 "LOW", {"via": "sql-dynamic", "lang": LANG})
+
+
+class _FirstPass(ast.NodeVisitor):
+    """Order-preserving pre-scan: class names, ORM tables, def name -> id.
+
+    Method ids mirror the typescript analyzer shape:
+    ``py:class:<Class>#<method>``.
+    """
+
+    def __init__(self):
+        self.stack = []  # enclosing class names
+        self.class_names = set()
+        self.file_tables = set()
+        self.name_to_id = {}
+
+    def visit_ClassDef(self, node):
+        self.class_names.add(node.name)
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Assign)
+                    and any(isinstance(t, ast.Name)
+                            and t.id == "__tablename__"
+                            for t in sub.targets)
+                    and _is_str(sub.value)):
+                self.file_tables.add(sub.value.value.lower())
+        self.stack.append(node.name)
+        self.generic_visit(node)
+        self.stack.pop()
+
+    def _visit_def(self, node):
+        if self.stack:
+            nid = f"py:class:{self.stack[-1]}#{node.name}"
+        else:
+            nid = f"py:function:{node.name}"
+        self.name_to_id.setdefault(node.name, nid)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        self._visit_def(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self._visit_def(node)
+
+
+def _route_decorator(dec):
+    """(framework, METHOD, route, line) for FastAPI/Flask route decorators."""
+    if not isinstance(dec, ast.Call):
+        return None
+    func = dec.func
+    if not (isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)):
+        return None
+    recv, attr = func.value.id, func.attr
+    if not (dec.args and _is_str(dec.args[0])):
+        return None
+    route = "/" + dec.args[0].value.strip("/")
+    if recv in _FASTAPI_OBJS and attr.lower() in _FASTAPI_METHODS:
+        return ("fastapi", attr.upper(), route, dec.lineno)
+    if recv in _FLASK_OBJS and attr == "route":
+        methods = ["GET"]
+        for kw in dec.keywords:
+            if (kw.arg == "methods"
+                    and isinstance(kw.value, (ast.List, ast.Tuple))):
+                found = [e.value.upper() for e in kw.value.elts
+                         if _is_str(e) and e.value.upper() in _KNOWN_HTTP]
+                if found:
+                    methods = found
+        return ("flask", "/".join(methods), route, dec.lineno)
+    return None
+
+
+def _deco_tag(dec):
+    """Decorator source text (fallback: dotted name) for job/click regexes."""
+    try:
+        seg = ast.get_source_segment(_DECO_SRC, dec)
+    except Exception:
+        seg = None
+    if seg:
+        return "@" + seg.strip()
+    dotted = _dotted(dec.func if isinstance(dec, ast.Call) else dec)
+    return "@" + (dotted or "")
+
+
+def _emit_import(ctx, rel, fw, node):
+    if isinstance(node, ast.Import):
+        targets = [a.name for a in node.names]
+    elif isinstance(node, ast.ImportFrom):
+        if node.module:
+            # ast separates the relative level, so `from ..pkg import m`
+            # records `pkg` (the legacy regex kept the dots: `..pkg`).
+            targets = [node.module]
+        else:
+            # `from . import x` — the module is the imported name.
+            targets = [a.name for a in node.names]
+    else:
+        return
+    for target in targets:
+        target = _clean_id(target)
+        if not target:
+            continue
+        if target.split(".")[0] in IMPORT_SKIP:
+            continue
+        ctx.edge(f"file:{rel}", f"unresolved:module:{target}",
+                 "imports", node.lineno, "MEDIUM",
+                 {"lang": LANG, "framework": fw})
+
+
+def _emit_call(ctx, rel, node, enclosing, class_names, file_tables,
+               name_to_id):
+    src = enclosing or f"file:{rel}"
+    line = node.lineno
+    func = node.func
+    # Django path(route, handler): endpoint node (MEDIUM) + handled-by (LOW).
+    is_path = (isinstance(func, ast.Name) and func.id == "path") or (
+        isinstance(func, ast.Attribute) and func.attr == "path")
+    if (is_path and len(node.args) >= 2 and _is_str(node.args[0])):
+        handler = _dotted(node.args[1])
+        if handler:
+            short = handler.split(".")[-1]
+            route = "/" + node.args[0].value.strip("/")
+            eid = f"endpoint:GET {route}"
+            ctx.node(eid, "endpoint", f"GET {route}", line, "MEDIUM",
+                     {"lang": LANG, "framework": "django",
+                      "handler": short})
+            ctx.edge(eid, f"unresolved:handler:{short}", "handled-by",
+                     line, "LOW", {"lang": LANG})
+    # ORM session.query(Model): queries edge (MEDIUM).
+    if (isinstance(func, ast.Attribute) and func.attr == "query"
+            and node.args and isinstance(node.args[0], ast.Name)):
+        model = _clean_id(node.args[0].id)
+        if model:
+            ctx.edge(src, _model_dst(model, class_names), "queries", line,
+                     "MEDIUM", {"via": "orm-query", "lang": LANG})
+    # SQL sinks over string-literal args (nested calls visited separately).
+    dotted_sink = (isinstance(func, ast.Attribute)
+                   and func.attr in SQL_DOTTED_SINKS)
+    bare_sink = (isinstance(func, ast.Name)
+                 and func.id in SQL_BARE_SINKS)
+    if dotted_sink or bare_sink:
+        frags = []
+        for a in list(node.args) + [k.value for k in node.keywords]:
+            frags.extend(_const_strs(a))
+        _sql_literal_edges(ctx, src, frags, line, file_tables)
+    # Same-file calls: enclosing function/method -> defined symbol (HIGH).
+    if (enclosing and isinstance(func, ast.Name)
+            and func.id in name_to_id):
+        dst = name_to_id[func.id]
+        base = (src.rsplit("#", 1)[-1] if "#" in src
+                else src.split(":")[-1])
+        if dst != src and func.id != base:
+            ctx.edge(src, dst, "calls", line, "HIGH",
+                     {"via": "same-file", "lang": LANG})
+    # Constructor-call + method-call: ``Service().create(...)`` resolves to
+    # the in-file class method (MEDIUM — the receiver type is name-resolved,
+    # not declared). Plain ``obj.method(...)`` stays unresolved: only an
+    # inline construction names the class deterministically.
+    if (enclosing and isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Call)
+            and isinstance(func.value.func, ast.Name)):
+        cls = func.value.func.id
+        if cls in class_names:
+            dst = f"py:class:{cls}#{func.attr}"
+            if dst != src:
+                ctx.edge(src, dst, "calls", line, "MEDIUM",
+                         {"via": "same-file-ctor", "lang": LANG})
+
+
+def _emit_attr(ctx, rel, node, parent, enclosing, class_names):
+    """Chained ``Model.query...`` / ``Model.objects...`` ORM usage.
+
+    Only fires inside a further attribute chain (``User.query.filter``),
+    mirroring the legacy ``\\.query\\.`` / ``\\.objects\\.`` patterns; a
+    bare ``session.query`` that is itself the call func is handled by the
+    Call visit instead.
+    """
+    if not isinstance(parent, ast.Attribute):
+        return
+    if not isinstance(node.value, ast.Name):
+        return
+    model = _clean_id(node.value.id)
+    if not model:
+        return
+    src = enclosing or f"file:{rel}"
+    if node.attr == "query":
+        ctx.edge(src, _model_dst(model, class_names), "queries",
+                 node.lineno, "MEDIUM",
+                 {"via": "orm-query", "lang": LANG})
+    elif node.attr == "objects":
+        ctx.edge(src, _model_dst(model, class_names), "reads",
+                 node.lineno, "MEDIUM",
+                 {"via": "orm-manager", "lang": LANG})
+
+
+def _emit_def(ctx, rel, fw, node, parent, enclosing, stack, class_names,
+              file_tables, name_to_id):
+    fname = node.name
+    line = node.lineno
+    if stack:
+        sym = f"{stack[-1][1]}#{fname}"
+        skind = "method"
+    else:
+        sym = f"py:function:{fname}"
+        skind = "function"
+    route, job_line = None, None
+    for dec in node.decorator_list:
+        r = _route_decorator(dec)
+        if r:
+            route = r  # last route decorator wins (legacy overwrite)
+        tag = _deco_tag(dec)
+        if CELERY_RE.search(tag) or SCHED_RE.search(tag):
+            job_line = getattr(dec, "lineno", line)
+        if CLICK_RE.search(tag):
+            hid = f"handler:{rel}:{dec.lineno}"
+            ctx.node(hid, "handler",
+                     f"cli@{rel.split('/')[-1]}:{dec.lineno}", dec.lineno,
+                     "MEDIUM", {"lang": LANG, "framework": "click"})
+            ctx.edge(f"file:{rel}", hid, "defines", dec.lineno, "HIGH", {})
+    if route:
+        _fw, method, route_s, mline = route
+        eid = f"endpoint:{method} {route_s}"
+        ctx.node(sym, skind, fname, line,
+                 "HIGH", {"lang": LANG, "framework": fw})
+        ctx.edge(f"file:{rel}", sym, "defines", line, "HIGH", {})
+        if skind == "method":
+            ctx.edge(stack[-1][1], sym, "defines", line, "HIGH", {})
+        ctx.node(eid, "endpoint", f"{method} {route_s}", mline,
+                 "HIGH", {"lang": LANG, "framework": fw,
+                          "handler": fname})
+        ctx.edge(eid, sym, "handled-by", mline, "HIGH", {})
+    elif job_line is not None:
+        ctx.node(sym, "job", fname, line,
+                 "HIGH", {"lang": LANG, "framework": fw})
+        ctx.edge(f"file:{rel}", sym, "defines", line, "HIGH", {})
+        if skind == "method":
+            ctx.edge(stack[-1][1], sym, "defines", line, "HIGH", {})
+    else:
+        ctx.node(sym, skind, fname, line,
+                 "HIGH", {"lang": LANG, "framework": fw})
+        ctx.edge(f"file:{rel}", sym, "defines", line, "HIGH", {})
+        if skind == "method":
+            ctx.edge(stack[-1][1], sym, "defines", line, "HIGH", {})
+    for stmt in node.body:
+        _emit_node(ctx, rel, fw, stmt, node, sym, stack, class_names,
+                   file_tables, name_to_id)
+
+
+def _emit_class(ctx, rel, fw, node, parent, stack, class_names,
+                file_tables, name_to_id):
+    cname = node.name
+    line = node.lineno
+    cid = f"py:class:{cname}"
+    bases = []
+    for b in node.bases:
+        d = _dotted(b)
+        if d:
+            bases.append(d)
+    for kw in node.keywords:
+        d = _dotted(kw.value)
+        bases.append(f"{kw.arg}={d}" if d else (kw.arg or ""))
+    nkind = "class"
+    if "Test" in cname or "test" in rel:
+        nkind = "test"
+    ctx.node(cid, nkind, cname, line, "HIGH",
+             {"lang": LANG, "framework": fw, "bases": bases})
+    ctx.edge(f"file:{rel}", cid, "defines", line, "HIGH", {})
+    best = None  # earliest __tablename__ assignment in the class subtree
+    for sub in ast.walk(node):
+        if (isinstance(sub, ast.Assign)
+                and any(isinstance(t, ast.Name)
+                        and t.id == "__tablename__" for t in sub.targets)
+                and _is_str(sub.value)):
+            if best is None or sub.lineno < best[0]:
+                best = (sub.lineno, sub.value.value.lower())
+    if best:
+        tn = best[1]
+        tid = f"table:{tn}"
+        ctx.node(tid, "table", tn, line, "HIGH",
+                 {"lang": LANG, "framework": fw,
+                  "via": "orm-model", "model": cname})
+        ctx.edge(f"file:{rel}", tid, "defines", line, "HIGH", {})
+        ctx.edge(cid, tid, "writes", line, "MEDIUM",
+                 {"via": "orm", "lang": LANG})
+    new_stack = stack + [(cname, cid)]
+    for stmt in node.body:
+        _emit_node(ctx, rel, fw, stmt, node, None, new_stack, class_names,
+                   file_tables, name_to_id)
+
+
+def _emit_node(ctx, rel, fw, node, parent, enclosing, stack, class_names,
+               file_tables, name_to_id):
+    if isinstance(node, ast.ClassDef):
+        _emit_class(ctx, rel, fw, node, parent, stack, class_names,
+                    file_tables, name_to_id)
+        return
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        _emit_def(ctx, rel, fw, node, parent, enclosing, stack,
+                  class_names, file_tables, name_to_id)
+        return
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        _emit_import(ctx, rel, fw, node)
+        return
+    if isinstance(node, ast.Call):
+        _emit_call(ctx, rel, node, enclosing, class_names, file_tables,
+                   name_to_id)
+    elif isinstance(node, ast.Attribute):
+        _emit_attr(ctx, rel, node, parent, enclosing, class_names)
+    for child in ast.iter_child_nodes(node):
+        _emit_node(ctx, rel, fw, child, node, enclosing, stack,
+                   class_names, file_tables, name_to_id)
+
+
+def _ast_scan(ctx, rel, text, tree):
+    global _DECO_SRC
+    _DECO_SRC = text
+    fw = _framework_of(text)
+    ctx.node(f"file:{rel}", "file", rel.split("/")[-1], 1, "HIGH",
+             {"lang": LANG, "framework": fw,
+              "role": "test" if ("test" in rel or "conftest" in rel)
+              else "source"})
+    fp = _FirstPass()
+    fp.visit(tree)
+    for stmt in tree.body:
+        _emit_node(ctx, rel, fw, stmt, tree, None, [], fp.class_names,
+                   fp.file_tables, fp.name_to_id)
+    # Line-local textual surface with no AST equivalent (single-line,
+    # newline-safe patterns only).
+    for i, line in enumerate(text.splitlines(), start=1):
+        for hm in HTTP_CALL_RE.finditer(line):
+            url = hm.group(2)
+            if url.startswith("/"):
+                eid = f"endpoint:{hm.group(1).upper()} {url}"
+                ctx.node(eid, "endpoint",
+                         f"{hm.group(1).upper()} {url}", i, "LOW",
+                         {"lang": LANG, "observed": "backend-consumer"})
+                ctx.edge(f"file:{rel}", eid, "consumes", i, "MEDIUM",
+                         {"http": hm.group(1).upper(), "lang": LANG})
+        for mm in MONGO_RE.finditer(line):
+            ctx.edge(f"file:{rel}", f"collection:{mm.group(1)}",
+                     "reads", i, "MEDIUM",
+                     {"via": "pymongo", "lang": LANG})
+        if REDIS_RE.search(line):
+            ctx.edge(f"file:{rel}", "cache:redis", "writes", i, "LOW",
+                     {"via": "redis-client", "lang": LANG})
+
+
+# ---------------------------------------------------------------------------
+# Legacy regex fallback (unparseable files: py2 sources, fragments)
+# ---------------------------------------------------------------------------
 
 def _pre_scan(lines):
     """Indentation-aware pre-scan.
@@ -152,19 +622,14 @@ def _emit_py_calls(ctx, src, body, i, name_to_id):
                      {"via": "same-file", "lang": LANG})
 
 
-def _model_dst(model, class_names):
-    if model in class_names:
-        return f"py:class:{model}"
-    return f"unresolved:class:{model}"
-
-
 def _emit_sql_edges(ctx, src, line, i, class_names, file_tables):
     """DML verbs in sink string literals + ORM model usage.
 
-    Literal tables resolve against in-file ``__tablename__`` tables
-    (``table:<name>``) and fall back to ``unresolved:table:<name>`` —
-    a bare ``table:`` id is never invented. Dynamic SQL (verb but no
-    literal table) becomes a LOW ``queries`` edge.
+    Literal tables target bare ``table:<name>`` ids (lowercased, matching
+    sql.py ``_tail_name``): the generic layer treats them as placeholders
+    only while no node with that id exists, and as resolved once any
+    analyzer owns the node. Dynamic SQL (verb but no literal table)
+    becomes a LOW ``queries`` edge.
     """
     if SQL_SINK_RE.search(line):
         contents = []
@@ -184,11 +649,9 @@ def _emit_sql_edges(ctx, src, line, i, class_names, file_tables):
                 tables.append(t)
             if tables:
                 for t in tables:
-                    tid = _clean_id(t.lower())
-                    if not tid:
+                    dst = _table_dst(ctx, t, file_tables)
+                    if not dst:
                         continue
-                    dst = (f"table:{tid}" if tid in file_tables
-                           else f"unresolved:table:{tid}")
                     ctx.edge(src, dst, etype, i, "MEDIUM",
                              {"via": "sql-literal", "lang": LANG})
             else:
@@ -214,7 +677,7 @@ def _emit_sql_edges(ctx, src, line, i, class_names, file_tables):
                  "MEDIUM", {"via": "orm-manager", "lang": LANG})
 
 
-def scan(ctx, path, text):
+def _legacy_scan(ctx, path, text):
     rel = ctx.path
     fw = _framework_of(text)
     ctx.node(f"file:{rel}", "file", rel.split("/")[-1], 1, "HIGH",
@@ -394,3 +857,20 @@ def scan(ctx, path, text):
         if REDIS_RE.search(line):
             ctx.edge(f"file:{rel}", "cache:redis", "writes", i, "LOW",
                      {"via": "redis-client", "lang": LANG})
+
+
+def scan(ctx, path, text):
+    """Primary AST pass; legacy regex fallback for unparseable files."""
+    try:
+        tree = ast.parse(text)
+    except Exception as exc:
+        ctx.scan_error(exc)
+        _legacy_scan(ctx, path, text)
+        return
+    try:
+        _ast_scan(ctx, ctx.path, text, tree)
+    except Exception as exc:
+        # The map must survive any single file: keep AST evidence already
+        # emitted and let the legacy pass add its line-local surface.
+        ctx.scan_error(exc)
+        _legacy_scan(ctx, path, text)

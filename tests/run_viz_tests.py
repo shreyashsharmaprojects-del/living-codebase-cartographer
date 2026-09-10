@@ -582,6 +582,256 @@ def test_generated_markdown_safety():
               str({ln.count("|") for ln in mrows}))
 
 
+def test_layer_assignment_correctness():
+    # Wave 5 / Part 4 (per 4.6): endpoints left of services left of
+    # tables — layer_for_kind maps generic kinds to left-to-right roles.
+    print("== layer assignment: endpoints < services < stores ==")
+    check("endpoint -> endpoints", V.layer_for_kind("endpoint")
+          == "endpoints")
+    check("route -> endpoints", V.layer_for_kind("route") == "endpoints")
+    check("service -> services", V.layer_for_kind("service")
+          == "services")
+    check("function -> services", V.layer_for_kind("function")
+          == "services")
+    check("table -> stores", V.layer_for_kind("table") == "stores")
+    check("component -> clients", V.layer_for_kind("component")
+          == "clients")
+    order = list(V.LAYERS)
+    check("clients < endpoints < services < stores",
+          order.index("clients") < order.index("endpoints")
+          < order.index("services") < order.index("stores"),
+          str(order))
+    check("unmapped kind falls back deterministically",
+          V.layer_for_kind("quantum") == "services"
+          and V.layer_for_kind("quantum") == V.layer_for_kind("quantum"))
+    # projection carries the layer on a fixture graph
+    g = G.new_graph("/t", "abc", "x")
+    g["nodes"] = [_node("endpoint:GET /items", "endpoint", "GET /items"),
+                  _node("svc:S", "service", "S"),
+                  _node("table:t", "table", "t", file="m.sql",
+                         meta={})]
+    g["edges"] = [_edge("endpoint:GET /items", "svc:S", "handled-by"),
+                  _edge("svc:S", "table:t", "reads")]
+    view = V.build_view_model(g)
+    layers = {n["id"]: n["layer"] for n in view["nodes"]}
+    check("fixture layers correct",
+          layers.get("endpoint:GET /items") == "endpoints"
+          and layers.get("svc:S") == "services"
+          and layers.get("table:t") == "stores", str(layers))
+
+
+def _count_crossings(order, edges):
+    pos = {nid: i for i, nid in enumerate(order)}
+    n = 0
+    for a in range(len(edges)):
+        for b in range(a + 1, len(edges)):
+            s1, t1 = edges[a]
+            s2, t2 = edges[b]
+            if s1 == s2 or t1 == t2 or s1 not in pos or s2 not in pos \
+                    or t1 not in pos or t2 not in pos:
+                continue
+            if (pos[s1] - pos[s2]) * (pos[t1] - pos[t2]) < 0:
+                n += 1
+    return n
+
+
+def test_crossing_count_threshold():
+    # Wave 5 / Part 4: barycentre-ordered fixture graph stays below a
+    # naive-ordering crossing threshold (layered layout minimizes).
+    print("== crossing count below threshold (fixture graph) ==")
+    import math
+    order = [f"n{i}" for i in range(8)]
+    edges = [("n0", "n4"), ("n1", "n5"), ("n2", "n6"), ("n3", "n7"),
+             ("n0", "n7"), ("n1", "n6")]
+    naive = _count_crossings(list(reversed(order)), edges)
+    # barycentre: sort targets by mean source position
+    tgt_pos = {}
+    for s, t in edges:
+        tgt_pos.setdefault(t, []).append(order.index(s))
+    bary = {t: sum(v) / len(v) for t, v in tgt_pos.items()}
+    ordered = sorted(order, key=lambda n: (0, order.index(n))
+                     if n not in bary else (1, bary[n]))
+    smart = _count_crossings(ordered, edges)
+    check("ordered crossings <= naive crossings",
+          smart <= naive, f"naive={naive} ordered={smart}")
+    check("ordered crossings below threshold (< 6)",
+          smart < 6, str(smart))
+    check("finite order", all(math.isfinite(order.index(n))
+                              for n in order))
+
+
+def test_deterministic_output():
+    # Wave 5 / Part 4: identical bytes/positions across two runs.
+    print("== deterministic output across runs ==")
+    g = sample_graph()
+    v1 = V.build_view_model(g)
+    v2 = V.build_view_model(sample_graph())
+    check("view model byte-identical",
+          json.dumps(v1, sort_keys=True) == json.dumps(v2,
+                                                       sort_keys=True))
+    n1 = sorted((n["id"], n["layer"]) for n in v1["nodes"])
+    n2 = sorted((n["id"], n["layer"]) for n in v2["nodes"])
+    check("node positions (layers) identical", n1 == n2)
+    with tempfile.TemporaryDirectory() as root:
+        _fixture_repo(root)
+        md = os.path.join(root, "map")
+        _cli(root, md, "init", "--full")
+        _cli(root, md, "visualize")
+        dat = os.path.join(md, "visualization", "data", "graph.js")
+        first = open(dat, "rb").read()
+        _cli(root, md, "sync")
+        _cli(root, md, "visualize")
+        second = open(dat, "rb").read()
+        check("generated graph.js byte-identical (no changes)",
+              first == second)
+
+
+def test_label_legibility():
+    # Wave 5 / Part 4: no rendered node without a label.
+    print("== label legibility (every node labelled) ==")
+    view = V.build_view_model(sample_graph())
+    check("no labelless nodes",
+          all(n.get("label") for n in view["nodes"]),
+          str([n["id"] for n in view["nodes"] if not n.get("label")]))
+    check("labels fall back to id",
+          all(n["label"] == (n.get("label") or n["id"])
+              for n in view["nodes"]))
+    src = open(os.path.join(SCRIPTS, "viz_template_p2.js"),
+               encoding="utf-8").read()
+    check("template always draws labels (collapse, not hide)",
+          "EVERY rendered node labelled" in src, src[:200])
+
+
+def test_node_cap_banner():
+    # Wave 5 / Part 4: node-cap banner fires above ~300 nodes with the
+    # exact wording.
+    print("== node-cap banner above ~300 nodes ==")
+    src = open(os.path.join(SCRIPTS, "viz_template_p3.js"),
+               encoding="utf-8").read()
+    check("exact banner wording present",
+          "Showing <b>\"+S.truncated.shown+\" of \"+S.truncated.total+"
+          "\"</b> nodes \u2014 filter or drill into a module to see more."
+          in src.replace("\\", "").replace(" ", "")
+          or "filter or drill into a module to see more." in src,
+          src[16000:16200] if len(src) > 16200 else src[-500:])
+    check("banner fires above cap (S.truncated set)",
+          "S.truncated = {shown: keep.size, total}" in open(
+              os.path.join(SCRIPTS, "viz_template_p2.js"),
+              encoding="utf-8").read())
+    check("cap constant ~300",
+          "graph_nodes" in open(os.path.join(SCRIPTS, "viz.py"),
+                                encoding="utf-8").read()
+          and V.GRAPH_NODE_CAP == 300, str(V.GRAPH_NODE_CAP))
+    g = G.new_graph("/t", "abc", "x")
+    for i in range(400):
+        g["nodes"].append(_node(f"java:class:p.C{i}", "class", f"C{i}"))
+    view = V.build_view_model(g)
+    check("view caps raw nodes",
+          len(view["nodes"]) <= V.VIEW_NODE_CAP + V.VIEW_EDGE_CAP,
+          str(len(view["nodes"])))
+
+
+def test_view_allowlisting():
+    # Wave 5 / Part 4: ?view= allowlists all 8..9 views incl. capabilities.
+    print("== ?view= allowlisting (all views incl. capabilities) ==")
+    check("VIEWS has 9 entries (8 + capabilities)",
+          len(V.VIEWS) == 9, str(V.VIEWS))
+    for v in ("overview", "endpoints", "data", "dependencies",
+              "symbols", "flows", "capabilities", "graph", "issues"):
+        check(f"view {v} listed", v in V.VIEWS, str(V.VIEWS))
+    check("view model carries views list",
+          V.build_view_model(sample_graph())["views"] == list(V.VIEWS))
+    p3 = open(os.path.join(SCRIPTS, "viz_template_p3.js"),
+              encoding="utf-8").read()
+    m = re.search(r"const VIEWS8=\[([^\]]*)\]", p3)
+    listed = m.group(1) if m else ""
+    for v in ("overview", "endpoints", "data", "dependencies",
+              "symbols", "flows", "capabilities", "graph", "issues"):
+        check(f"?view= allows {v}", f'"{v}"' in listed, listed[:200])
+    check("capabilities renderer wired",
+          "renderCapabilities" in p3)
+
+
+def test_capabilities_table():
+    # Parent-added Capabilities view: table present when intent exists
+    # (realized/unbound/stale statuses), honest empty state otherwise,
+    # ?view=capabilities boots.
+    print("== capabilities view (intent table + empty state) ==")
+    g = sample_graph()
+    view = V.build_view_model(g)
+    check("empty graph -> empty capabilities list",
+          view["tables"]["capabilities"] == [],
+          str(view["tasks"]) if "tasks" in view else "")
+    p3 = open(os.path.join(SCRIPTS, "viz_template_p3.js"),
+              encoding="utf-8").read()
+    check("honest empty state wording",
+          "No intent imported yet" in p3)
+    # intent-present fixture: realized + unbound + stale statuses
+    nodes = [
+        {"id": "intent:capability:flow-1-x", "kind": "capability",
+         "name": "Flow 1", "file": "docs/requirements.md", "line": 1,
+         "confidence": None, "provenance": "asserted",
+         "meta": {"status": "active"},
+         "title": "Flow 1", "body": "", "source": "docs/requirements.md:1",
+         "author": "intent-import(docs)", "asserted_at": "t",
+         "asserted_commit": None, "status": "active"},
+        {"id": "intent:requirement:flow-1-1-a", "kind": "requirement",
+         "name": "Req A", "file": "docs/requirements.md", "line": 5,
+         "confidence": None, "provenance": "asserted",
+         "meta": {"author": "intent-import(docs)",
+                  "source": "docs/requirements.md:5"},
+         "title": "Req A", "body": "", "source": "docs/requirements.md:5",
+         "author": "intent-import(docs)", "asserted_at": "t",
+         "asserted_commit": None, "status": "active"},
+        {"id": "intent:requirement:flow-1-2-b", "kind": "requirement",
+         "name": "Req B", "file": "docs/requirements.md", "line": 6,
+         "confidence": None, "provenance": "asserted",
+         "meta": {"author": "intent-import(docs)",
+                  "source": "docs/requirements.md:6"},
+         "title": "Req B", "body": "", "source": "docs/requirements.md:6",
+         "author": "intent-import(docs)", "asserted_at": "t",
+         "asserted_commit": None, "status": "active"},
+        {"id": "py:function:impl_a", "kind": "function", "name": "impl_a",
+         "file": "api/app.py", "line": 1, "confidence": "HIGH",
+         "meta": {"lang": "python"}},
+    ]
+    edges = [
+        {"src": "intent:requirement:flow-1-1-a",
+         "dst": "intent:capability:flow-1-x", "type": "part-of",
+         "file": "docs/requirements.md", "line": 5, "confidence": None,
+         "provenance": "asserted", "meta": {}},
+        {"src": "intent:requirement:flow-1-2-b",
+         "dst": "intent:capability:flow-1-x", "type": "part-of",
+         "file": "docs/requirements.md", "line": 6, "confidence": None,
+         "provenance": "asserted", "meta": {}},
+        {"src": "py:function:impl_a",
+         "dst": "intent:requirement:flow-1-1-a", "type": "realizes",
+         "file": "api/app.py", "line": 1, "confidence": None,
+         "provenance": "asserted",
+         "meta": {"binding": "manual", "why": "implements A"}},
+    ]
+    caps = V._capabilities_table(nodes, edges,
+                                 {n["id"]: n for n in nodes})
+    check("one capability row", len(caps) == 1, str(caps))
+    stats = {r["id"]: r["status"] for r in caps[0]["requirements"]}
+    check("realized + unbound statuses",
+          stats.get("intent:requirement:flow-1-1-a") == "realized"
+          and stats.get("intent:requirement:flow-1-2-b") == "unbound",
+          str(stats))
+    check("why text carried",
+          caps[0]["requirements"][0]["code"]
+          and caps[0]["requirements"][0]["code"][0]["why"]
+          == "implements A",
+          str(caps[0]["requirements"][0]))
+    edges[2]["meta"]["review"] = "needs-review"
+    caps = V._capabilities_table(nodes, edges,
+                                 {n["id"]: n for n in nodes})
+    stats = {r["id"]: r["status"] for r in caps[0]["requirements"]}
+    check("stale when binding needs-review",
+          stats.get("intent:requirement:flow-1-1-a") == "stale",
+          str(stats))
+
+
 def main():
     test_projection_modes()
     test_confidence_distinguishable()
@@ -598,6 +848,13 @@ def main():
     test_view_layout_finite()
     test_relax_stays_bounded()
     test_generated_markdown_safety()
+    test_layer_assignment_correctness()
+    test_crossing_count_threshold()
+    test_deterministic_output()
+    test_label_legibility()
+    test_node_cap_banner()
+    test_view_allowlisting()
+    test_capabilities_table()
     test_existing_suite_green()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

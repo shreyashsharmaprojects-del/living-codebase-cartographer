@@ -99,6 +99,7 @@ table.tv td.mono{font-family:var(--mono)}
 .pill.HIGH{color:#7ee787;border-color:#2a5a35}
 .pill.MEDIUM{color:#9fb3c8}.pill.LOW{color:#8b949e;border-style:dashed}
 .pill.UNKNOWN{color:#5b6572;border-style:dashed}
+.pill.ASSERTED{color:#d2a8ff;border-color:#6e40c9}
 .step{display:flex;gap:8px;align-items:baseline;padding:4px 0;border-bottom:1px solid #222a36;font-size:12px}
 .step .i{font-family:var(--mono);color:var(--faint);min-width:24px}
 .manifest{font-family:var(--mono);font-size:12px;color:var(--accent);margin:12px 0 4px}
@@ -185,9 +186,9 @@ kbd{background:var(--panel2);border:1px solid var(--border);border-radius:4px;pa
   </div>
 </div>
 <div id="help"><div class="box"><h2>Keyboard shortcuts</h2>
-<div><kbd>/</kbd> search &nbsp; <kbd>↑</kbd><kbd>↓</kbd> move &nbsp; <kbd>Enter</kbd> open</div>
-<div><kbd>Esc</kbd> clear selection / close &nbsp; <kbd>F</kbd> fit &nbsp; <kbd>+</kbd> <kbd>−</kbd> zoom</div>
-<div><kbd>[</kbd> back &nbsp; <kbd>]</kbd> forward &nbsp; <kbd>?</kbd> this overlay</div>
+<div><kbd>/</kbd> search &nbsp; <kbd>↑</kbd><kbd>↓</kbd> search results &nbsp; <kbd>Enter</kbd> focus search hit</div>
+<div><kbd>←</kbd><kbd>→</kbd> neighbours (graph) &nbsp; <kbd>Enter</kbd> focus selected node &nbsp; <kbd>Esc</kbd> clear</div>
+<div><kbd>F</kbd> fit &nbsp; <kbd>+</kbd> <kbd>−</kbd> zoom &nbsp; <kbd>[</kbd> back &nbsp; <kbd>]</kbd> forward &nbsp; <kbd>?</kbd> this overlay</div>
 <div style="margin-top:8px"><button class="btn" id="helpclose">Close</button></div>
 </div></div>
 <script>
@@ -222,6 +223,7 @@ const S = {
   group: null,      // drilled-in group id (architecture mode)
   depth: 2,
   collapsed: {},    // group id -> true (module containers, start collapsed)
+  folded: {},       // group name -> true (explicit header-click folds)
   cam: {x:0, y:0, k:1},
   nodes: [], edges: [],       // current laid-out view
   byId: {}, adj: {}, inadj: {},
@@ -231,7 +233,9 @@ const S = {
   tfilter: "",                // table text filter
   tsort: null,                // {col,dir}
   symKind: "", symLang: "", symFile: "",
-  issueSev: "",
+  issueSev: "", issueCat: "",
+  depSort: null,      // dependencies table sort {col,dir}
+  narrow: false,      // narrow viewport -> top-to-bottom graph flow
 };
 const CONF_STYLE = {
   HIGH:    {w:1.6, dash:[],      a:0.85},

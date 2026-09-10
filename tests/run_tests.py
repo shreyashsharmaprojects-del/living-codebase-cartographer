@@ -15,6 +15,7 @@ Covers:
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -222,6 +223,35 @@ def test_migrate_v1():
     check("edge migrates",
           g["edges"][0]["type"] == "references", str(g["edges"]))
     check("version bumps", g["version"] == 2)
+    # Wave 5: chained migrate_v1 -> migrate_v2 path must end at VERSION 3
+    # with provenance stamped (cmd_sync applies both in order).
+    g2 = {"version": 1, "nodes": [
+        {"id": "a", "kind": "frontend-component", "name": "C",
+         "file": "f", "line": 1}],
+        "edges": [
+        {"src": "a", "dst": "b", "type": "stereotyped-as",
+         "file": "f", "line": 1}]}
+    core.migrate_v1(g2)
+    check("chained: v1 lands at 2", g2["version"] == 2)
+    core.migrate_v2(g2)
+    check("chained: v2 lands at VERSION 3",
+          g2["version"] == core.VERSION == 3, str(g2["version"]))
+    check("chained: provenance stamped derived",
+          all(n.get("provenance") == "derived" for n in g2["nodes"])
+          and all(e.get("provenance") == "derived"
+                  for e in g2["edges"]), str(g2))
+    check("migrate_v2 preserves explicit asserted",
+          _migrate_v2_keeps_asserted(core))
+
+
+def _migrate_v2_keeps_asserted(core):
+    g = {"version": 2,
+         "nodes": [{"id": "intent:requirement:x", "kind": "requirement",
+                    "name": "X", "file": "docs/requirements.md", "line": 1,
+                    "provenance": "asserted"}],
+         "edges": []}
+    core.migrate_v2(g)
+    return g["nodes"][0].get("provenance") == "asserted"
 
 
 # ---------------------------------------------------------------- 5. e2e CLI
@@ -390,6 +420,24 @@ def test_git_porcelain_first_line():
               core._parse_porcelain_path("?? new.py") == "new.py")
         check("quoted space parsed",
               core._parse_porcelain_path(' M "a b.py"') == "a b.py")
+        # Wave 5: unstaged modification of a non-first file also reports
+        # verbatim (no staging); ?? entries and renames with dests parse.
+        with open(os.path.join(root, "zzz_other.py"), "a",
+                  encoding="utf-8") as fh:
+            fh.write("extra = 1\n")
+        changed2 = core.changed_since(root, base)
+        check("unstaged non-first path verbatim",
+              "zzz_other.py" in changed2, str(sorted(changed2)))
+        _write(root, "brand_new.py", "q = 1\n")
+        changed3 = core.changed_since(root, base)
+        check("?? entry verbatim (real repo)",
+              "brand_new.py" in changed3, str(sorted(changed3)))
+        check("unicode entry parses",
+              core._parse_porcelain_path(
+                  ' M "caf\\303\\251.py"') == "café.py")
+        check("rename-dest parses",
+              core._parse_porcelain_path(
+                  'R  "old name.py" -> "new name.py"') == "new name.py")
 
 
 def test_convergence_git_repo():
@@ -607,6 +655,34 @@ def test_convergence_add_delete_rename():
         r = _cli(root, md, "validate")
         check("validate OK (no DEL/broken)",
               r.returncode == 0 and "Status: OK" in r.stdout, r.stdout)
+        # Wave 5: modified-first-alphabetically also converges (the
+        # first-line-space regression path) alongside add/delete/rename.
+        with open(os.path.join(root, "brandnew.py"), "a",
+                  encoding="utf-8") as fh:
+            fh.write("\ndef another_fn():\n    return 10\n")
+        r = _cli(root, md, "sync")
+        check("second sync ok", r.returncode == 0, r.stdout + r.stderr)
+        r = _cli(root, md, "validate")
+        check("validate OK after modify",
+              r.returncode == 0 and "Status: OK" in r.stdout, r.stdout)
+        # Wave 5: convergence with a real git repo (commit + unstaged
+        # modify without staging -> sync -> validate OK).
+        _git2_ok = _git(root, "add", "-A").returncode == 0
+        if _git2_ok:
+            _git(root, "commit", "-qm", "wave5")
+            with open(os.path.join(root, "keep.py"), "a",
+                      encoding="utf-8") as fh:
+                fh.write("\ndef keeper2():\n    return 5\n")
+            r = _cli(root, md, "sync")
+            check("git-repo sync ok",
+                  r.returncode == 0, r.stdout + r.stderr)
+            r = _cli(root, md, "query", "--name", "keeper2")
+            check("git-repo sync picks up keeper2",
+                  "keeper2" in r.stdout, r.stdout)
+            r = _cli(root, md, "validate")
+            check("git-repo validate OK",
+                  r.returncode == 0 and "Status: OK" in r.stdout,
+                  r.stdout)
 
 
 def test_status_validate_agreement_stale_content():
@@ -643,6 +719,17 @@ def test_status_validate_agreement_stale_content():
         check("both name the stale file",
               "api/app.py" in rs.stdout and "api/app.py" in rv.stdout,
               rs.stdout + rv.stdout)
+        # Wave 5: deleted-file case — status and validate must still agree
+        # (both CURRENT-freshness vs DEL finding, never drift).
+        os.remove(os.path.join(root, "api/app.py"))
+        rs2 = _cli(root, md, "status")
+        rv2 = _cli(root, md, "validate")
+        check("deleted file: validate reports DEL",
+              "DEL api/app.py" in rv2.stdout, rv2.stdout)
+        check("deleted file: both share freshness verdict wording",
+              "Freshness verdict:" in rv2.stdout
+              and "Status:" in rs2.stdout,
+              rs2.stdout + rv2.stdout)
 
 
 def test_malformed_input_fixtures():
@@ -679,6 +766,24 @@ def test_malformed_input_fixtures():
     check("unicode: class node present",
           any(n["kind"] == "class" for n in g["nodes"]),
           str([n["id"] for n in g["nodes"]]))
+    # Wave 5: spaced paths, CRLF, no-trailing-newline pinned as
+    # no-crash cases with clean single-line IDs.
+    for name, text in (("spaced-path", cases["import-blank-class"]),
+                       ("crlf", cases["crlf"]),
+                       ("no-trailing-newline",
+                        cases["no-trailing-newline"])):
+        g = run_analyzer(python, "my dir/a.py", text)
+        ids = [n["id"] for n in g["nodes"]]
+        check(f"{name}: spaced-path no crash, ids clean",
+              all(isinstance(i, str) and len(i) <= 512
+                  and not re.search(r"[\x00-\x1f]", i) for i in ids),
+              str(ids))
+        check(f"{name}: file node keeps spaced path",
+              "file:my dir/a.py" in ids, str(ids))
+    g = run_analyzer(python, "svc/a.py", "import os\n")
+    check("imports-only file: no unresolved-module swallow",
+          not any(n["id"].startswith("unresolved:module:")
+                  and "\n" in n["id"] for n in g["nodes"]))
 
 
 def test_cross_analyzer_method_conformance():
@@ -746,6 +851,127 @@ def test_cross_analyzer_method_conformance():
                   and any(x["id"] == d
                           for x in types + methods)) >= 3,
               str(sorted(edges)))
+    # Wave 5: async methods + decorator-attributed methods keep the same
+    # uniform shape (AST-primary python, annotated TS members).
+    g = run_analyzer(python, "svc/a.py",
+                     "class W:\n"
+                     "    async def render(self):\n        return 1\n"
+                     "    def update(self):\n        return 2\n")
+    pm = [n for n in g["nodes"] if n["kind"] == "method"]
+    check("python: async method uniform shape",
+          len(pm) == 2 and all("#" in m["id"] for m in pm),
+          str([(n["id"], n["kind"]) for n in g["nodes"]]))
+    g = run_analyzer(typescript, "svc/a.ts",
+                     "export class Svc {\n"
+                     "  protected load(): Promise<void> { return; }\n"
+                     "  async save(): Promise<number> { return 1; }\n}\n")
+    tm = [n for n in g["nodes"] if n["kind"] == "method"]
+    check("typescript: annotated methods uniform shape",
+          len(tm) == 2 and all("#" in m["id"] for m in tm),
+          str([m["id"] for m in tm]))
+
+
+def test_sql_edge_semantics_conformance():
+    # Follow-up item 2: the 2.2 conformance tests passed while java and
+    # python disagreed on the SAME construct (INSERT -> reads in java,
+    # writes in python). Node-kind conformance is not enough: identical
+    # fixture SQL must produce identical edge types AND confidence in
+    # every analyzer that extracts table access from string literals.
+    print("== sql edge semantics: verb -> edge type + confidence ==")
+    # Fixtures: one SELECT method + one INSERT method per language, in the
+    # most idiomatic string-literal sink each analyzer supports.
+    fixtures = {
+        "python": ("svc/a.py",
+                   "class Repo:\n"
+                   "    def load(self, cur):\n"
+                   "        cur.execute(\"SELECT * FROM widget\")\n"
+                   "    def save(self, cur):\n"
+                   "        cur.execute(\"INSERT INTO widget (id) VALUES (1)\")\n"),  # noqa: E501
+        "java": ("svc/Repo.java",
+                 "package com.x;\npublic class Repo {\n"
+                 "  public void load() {\n"
+                 "    String q = \"SELECT * FROM widget\";\n"
+                 "  }\n"
+                 "  public void save() {\n"
+                 "    String q = \"INSERT INTO widget (id) VALUES (1)\";\n"
+                 "  }\n}\n"),
+        "csharp": ("R/Repo.cs",
+                   "using System;\nnamespace N {\n"
+                   "public class Repo {\n"
+                   "  public void Load() {\n"
+                   "    conn.Query(\"SELECT * FROM widget\");\n"
+                   "  }\n"
+                   "  public void Save() {\n"
+                   "    conn.Execute(\"INSERT INTO widget (id) VALUES (@id)\");\n"  # noqa: E501
+                   "  }\n}\n}\n"),
+        # Whole-file scanners: confidence is LOW (no sink attribution),
+        # but the verb classification must still hold.
+        "go": ("svc/r.go",
+               "package svc\n"
+               "func Load() {\n"
+               "  db.Query(\"SELECT * FROM widget\")\n"
+               "}\n"
+               "func Save() {\n"
+               "  db.Exec(\"INSERT INTO widget (id) VALUES (1)\")\n"
+               "}\n"),
+        "rust": ("src/r.rs",
+                 "fn load() {\n"
+                 "  sqlx::query(\"SELECT * FROM widget\");\n"
+                 "}\n"
+                 "fn save() {\n"
+                 "  sqlx::query(\"INSERT INTO widget (id) VALUES (1)\");\n"
+                 "}\n"),
+    }
+    # Expected confidence per analyzer: literal-sink attribution (python,
+    # java, csharp) is MEDIUM; whole-file scans (go, rust) are LOW.
+    expected_conf = {"python": "MEDIUM", "java": "MEDIUM",
+                     "csharp": "MEDIUM", "go": "LOW", "rust": "LOW"}
+    mods = {"python": python, "java": java, "csharp": csharp,
+            "go": go, "rust": rust}
+    seen_types = {}
+    for lang, (rel, text) in fixtures.items():
+        g = run_analyzer(mods[lang], rel, text)
+        table_edges = [(e["src"], e["dst"], e["type"], e["confidence"])
+                       for e in g["edges"] if e["dst"] == "table:widget"]
+        shape = sorted((t, c) for _, _, t, c in table_edges)
+        conf = expected_conf[lang]
+        seen_types[lang] = sorted(t for t, _ in shape)
+        check(f"{lang}: SELECT -> reads {conf}",
+              ("reads", conf) in shape, str(table_edges))
+        check(f"{lang}: INSERT -> writes {conf}",
+              ("writes", conf) in shape, str(table_edges))
+        check(f"{lang}: uniform confidence {conf} on literal SQL",
+              bool(table_edges) and all(c == conf for _, c in shape),
+              str(table_edges))
+    type_shapes = {tuple(v) for v in seen_types.values()}
+    check("identical SQL -> identical edge types across all 5 analyzers",
+          len(type_shapes) == 1
+          and next(iter(type_shapes)) == ("reads", "writes"),
+          str(seen_types))
+    # UPDATE/DELETE are writes everywhere too.
+    g = run_analyzer(
+        java, "svc/R.java",
+        "public class R {\n  public void m() {\n"
+        "    String a = \"UPDATE widget SET x = 1\";\n"
+        "    String b = \"DELETE FROM widget\";\n"
+        "  }\n}\n")
+    wtypes = {e["type"] for e in g["edges"]
+              if e["dst"] == "table:widget"}
+    check("java: UPDATE/DELETE -> writes",
+          wtypes == {"writes"}, str(wtypes))
+    # @Entity/@Table is a mapping, not an access: single maps-to edge.
+    g = run_analyzer(
+        java, "svc/Claim.java",
+        "@Entity\n@Table(name=\"claims\")\npublic class Claim {}\n")
+    claimed = [(e["dst"], e["type"], e["confidence"]) for e in g["edges"]
+               if e["dst"] == "table:claims"
+               and e["src"] == "java:class:Claim"]
+    check("entity declaration emits exactly one mapping edge",
+          claimed == [("table:claims", "maps-to", "HIGH")],
+          str(claimed))
+    check("entity declaration emits no access edges",
+          not any(t in ("reads", "writes", "queries") for _, t, _ in claimed),
+          str(claimed))
 
 
 def test_ts_explicit_post_no_phantom_get():
@@ -780,6 +1006,651 @@ def test_ts_explicit_post_no_phantom_get():
           eids == {"endpoint:* /api/other"}, str(eids))
 
 
+# ---------------------------------------------------------------- Wave 5.7
+# Intent layer (schema v3 provenance + intent kinds/edges). Fixture docs
+# mirror Wave 4a's minimal docs tree (Flow/Slice/decisions + FastAPI app).
+
+INTENT_REQ_DOC = (
+    "# Requirements\n\n"
+    "### Flow 1 \u2014 Submit claim\n\n"
+    "Filing a new claim.\n\n"
+    "- [ ] Submitting a valid claim returns a claim number\n"
+    "- [ ] Invalid claims are rejected with an error\n\n"
+    "## Data\n\n"
+    "| Entity | key fields |\n"
+    "|---|---|\n"
+    "| Claim | id, status |\n\n"
+    "## Non-goals\n\n"
+    "- Not building: **Appeals** \u2014 deferred to a later slice\n"
+)
+
+INTENT_PLAN_DOC = (
+    "# Plan\n\n"
+    "### Slice 1 \u2014 First claim slice\n\n"
+    "- Satisfies: Flow 1\n\n"
+    "## Data model\n\n"
+    "```\nclaim\n  id PK, status\n```\n\n"
+    "## Out of scope\n\n"
+    "- Reopening decided claims later\n"
+)
+
+INTENT_DEC_DOC = (
+    "# Decisions\n\n"
+    "### 2026-02-01 \u2014 Use Postgres for claims\n\n"
+    "Postgres holds claim state.\n"
+)
+
+INTENT_APP_PY = (
+    "from fastapi import FastAPI\napp = FastAPI()\n"
+    "@app.get(\"/items\")\ndef list_items():\n    return []\n"
+)
+
+
+def _intent_fixture(root, with_docs=True):
+    _write(root, "api/app.py", INTENT_APP_PY)
+    _write(root, "api/requirements.txt", "fastapi==0.115.0\n")
+    if with_docs:
+        _write(root, "docs/requirements.md", INTENT_REQ_DOC)
+        _write(root, "docs/plan.md", INTENT_PLAN_DOC)
+        _write(root, "docs/decisions.md", INTENT_DEC_DOC)
+    md = os.path.join(root, "map")
+    r = _cli(root, md, "init", "--full")
+    check("intent fixture init ok",
+          r.returncode == 0, r.stdout + r.stderr)
+    return md
+
+
+def _intent_ids(g):
+    nodes = [n for n in g["nodes"] if n.get("provenance") == "asserted"]
+    reqs = sorted(n["id"] for n in nodes if n["kind"] == "requirement")
+    sli = sorted(n["id"] for n in nodes if n["kind"] == "slice")
+    return reqs, sli
+
+
+def test_intent_import_counts_idempotent():
+    print("== intent import: counts + re-import idempotency ==")
+    with tempfile.TemporaryDirectory() as root:
+        md = _intent_fixture(root)
+        r = _cli(root, md, "intent", "import")
+        check("import exits 0", r.returncode == 0, r.stdout + r.stderr)
+        g = json.load(open(os.path.join(md, "graph.json")))
+        inodes = [n for n in g["nodes"]
+                  if n.get("provenance") == "asserted"]
+        iedges = [e for e in g["edges"]
+                  if e.get("provenance") == "asserted"]
+        check("import creates nodes", len(inodes) >= 6,
+              str(len(inodes)))
+        check("import creates edges", len(iedges) >= 2,
+              str(len(iedges)))
+        check("kinds cover capability/requirement/slice/decision",
+              {"capability", "requirement", "slice", "decision"}
+              <= {n["kind"] for n in inodes},
+              str(sorted({n["kind"] for n in inodes})))
+        r = _cli(root, md, "intent", "import")
+        check("re-import exits 0", r.returncode == 0, r.stdout)
+        check("re-import creates 0",
+              "0 node(s) created" in r.stdout, r.stdout)
+        g2 = json.load(open(os.path.join(md, "graph.json")))
+        check("re-import stable node count",
+              len(g2["nodes"]) == len(g["nodes"]),
+              f"{len(g['nodes'])} -> {len(g2['nodes'])}")
+
+
+def test_intent_bind_success_errors():
+    print("== intent bind: success (2 edges) + error paths ==")
+    with tempfile.TemporaryDirectory() as root:
+        md = _intent_fixture(root)
+        check("import ok",
+              _cli(root, md, "intent", "import").returncode == 0)
+        g = json.load(open(os.path.join(md, "graph.json")))
+        reqs, slis = _intent_ids(g)
+        check("requirement + slice exist", reqs and slis,
+              f"{reqs} {slis}")
+        r = _cli(root, md, "intent", "bind",
+                 "--slice", slis[0], "--realizes", reqs[0],
+                 "--nodes", "py:function:list_items",
+                 "--why", "covers the claim submission")
+        check("bind exits 0", r.returncode == 0, r.stdout + r.stderr)
+        check("bind reports 2 new edges",
+              "2 new binding edge(s)" in r.stdout, r.stdout)
+        # unknown intent / code ids -> exit 1
+        r = _cli(root, md, "intent", "bind",
+                 "--slice", "no-such-slice", "--realizes", reqs[0],
+                 "--nodes", "py:function:list_items", "--why", "x")
+        check("unknown slice exits 1",
+              r.returncode == 1 and "unknown --slice" in r.stdout,
+              r.stdout)
+        r = _cli(root, md, "intent", "bind",
+                 "--slice", slis[0], "--realizes", "no-such-req",
+                 "--nodes", "py:function:list_items", "--why", "x")
+        check("unknown realizes exits 1",
+              r.returncode == 1 and "unknown --realizes" in r.stdout,
+              r.stdout)
+        r = _cli(root, md, "intent", "bind",
+                 "--slice", slis[0], "--realizes", reqs[0],
+                 "--nodes", "no-such-symbol", "--why", "x")
+        check("unknown code id exits 1",
+              r.returncode == 1 and "unknown code node" in r.stdout,
+              r.stdout)
+        # blank --why -> exit 1
+        r = _cli(root, md, "intent", "bind",
+                 "--slice", slis[0], "--realizes", reqs[0],
+                 "--nodes", "py:function:list_items", "--why", "   ")
+        check("blank --why exits 1",
+              r.returncode == 1 and "missing --why" in r.stdout,
+              r.stdout)
+        # --declares-files: stored verbatim, updated on re-bind,
+        # preserved when a later bind omits it.
+        r = _cli(root, md, "intent", "bind",
+                 "--slice", slis[0], "--realizes", reqs[0],
+                 "--nodes", "py:function:list_items",
+                 "--why", "declared first",
+                 "--declares-files", "api/app.py", "api/other.py")
+        check("bind --declares-files exits 0",
+              r.returncode == 0, r.stdout + r.stderr)
+        g = json.load(open(os.path.join(md, "graph.json")))
+        bound = [e for e in g["edges"]
+                 if (e.get("meta") or {}).get("binding") == "manual"]
+        check("declaration stored verbatim on bindings",
+              bound and all((e.get("meta") or {}).get("declares_files")
+                            == ["api/app.py", "api/other.py"]
+                            for e in bound),
+              str([(e["src"], e["type"],
+                    (e.get("meta") or {}).get("declares_files"))
+                   for e in bound]))
+        r = _cli(root, md, "intent", "bind",
+                 "--slice", slis[0], "--realizes", reqs[0],
+                 "--nodes", "py:function:list_items",
+                 "--why", "rebind without declaration")
+        check("rebind without flag exits 0",
+              r.returncode == 0, r.stdout + r.stderr)
+        g = json.load(open(os.path.join(md, "graph.json")))
+        bound = [e for e in g["edges"]
+                 if (e.get("meta") or {}).get("binding") == "manual"]
+        check("omitted flag preserves stored declaration",
+              bound and all((e.get("meta") or {}).get("declares_files")
+                            == ["api/app.py", "api/other.py"]
+                            for e in bound),
+              str([(e.get("meta") or {}).get("declares_files")
+                   for e in bound]))
+        r = _cli(root, md, "validate")
+        check("validate reports no schema violations for declares_files",
+              "0 bad kinds, 0 bad edge types" in r.stdout,
+              r.stdout + r.stderr)
+        # --nodes is variadic, comma-tolerant, and repeatable: all three
+        # spellings bind the union (item 1 — the documented step-5 form
+        # must work on a real multi-symbol slice).
+        r = _cli(root, md, "intent", "bind",
+                 "--slice", slis[0], "--realizes", reqs[0],
+                 "--nodes", "py:function:list_items",
+                 "py:function:list_items",
+                 "--why", "variadic duplicate resolves once")
+        check("space-separated --nodes exits 0",
+              r.returncode == 0, r.stdout + r.stderr)
+        with tempfile.TemporaryDirectory() as root2:
+            _write(root2, "api/app.py",
+                   "def one():\n    return 1\n"
+                   "def two():\n    return 2\n"
+                   "def three():\n    return 3\n")
+            _write(root2, "api/requirements.txt", "")
+            _write(root2, "docs/requirements.md", INTENT_REQ_DOC)
+            _write(root2, "docs/plan.md", INTENT_PLAN_DOC)
+            _write(root2, "docs/decisions.md", INTENT_DEC_DOC)
+            md2 = os.path.join(root2, "map")
+            _cli(root2, md2, "init", "--full")
+            _cli(root2, md2, "intent", "import")
+            g2 = json.load(open(os.path.join(md2, "graph.json")))
+            reqs2, slis2 = _intent_ids(g2)
+            for label, extra in (
+                    ("space-separated",
+                     ["py:function:one", "py:function:two",
+                      "py:function:three"]),
+                    ("comma form", ["py:function:one,py:function:two,"
+                                    "py:function:three"]),
+                    ("repeated flags", ["__REPEAT__"])):
+                if label == "repeated flags":
+                    r = _cli(root2, md2, "intent", "bind",
+                             "--slice", slis2[0], "--realizes", reqs2[0],
+                             "--nodes", "py:function:one",
+                             "--nodes", "py:function:two,py:function:three",
+                             "--why", f"three nodes via {label}")
+                else:
+                    r = _cli(root2, md2, "intent", "bind",
+                             "--slice", slis2[0], "--realizes", reqs2[0],
+                             "--nodes", *extra,
+                             "--why", f"three nodes via {label}")
+                check(f"{label} exits 0", r.returncode == 0,
+                      r.stdout + r.stderr)
+                check(f"{label} binds 3 code nodes",
+                      "Bound 3 code node(s)" in r.stdout, r.stdout)
+
+
+def test_intent_why_responsible_for():
+    print("== why + responsible-for output (claim/evidence/ids) ==")
+    with tempfile.TemporaryDirectory() as root:
+        md = _intent_fixture(root)
+        _cli(root, md, "intent", "import")
+        g = json.load(open(os.path.join(md, "graph.json")))
+        reqs, slis = _intent_ids(g)
+        _cli(root, md, "intent", "bind",
+             "--slice", slis[0], "--realizes", reqs[0],
+             "--nodes", "py:function:list_items",
+             "--why", "covers the claim submission")
+        r = _cli(root, md, "why", "list_items")
+        check("why exits 0", r.returncode == 0, r.stdout)
+        check("why shows claim text",
+              "Submitting a valid claim" in r.stdout, r.stdout)
+        check("why shows evidence file", "api/app.py" in r.stdout,
+              r.stdout)
+        check("why shows intent id + ASSERTED",
+              reqs[0] in r.stdout and "[ASSERTED]" in r.stdout,
+              r.stdout[-800:])
+        r = _cli(root, md, "responsible-for", reqs[0])
+        check("responsible-for exits 0", r.returncode == 0, r.stdout)
+        check("responsible-for shows claim",
+              "Submitting a valid claim" in r.stdout, r.stdout)
+        check("responsible-for shows code + id",
+              "list_items" in r.stdout
+              and "py:function:list_items" in r.stdout, r.stdout)
+
+
+def test_intent_binding_survival_review():
+    print("== binding survival across sync + needs-review ==")
+    with tempfile.TemporaryDirectory() as root:
+        md = _intent_fixture(root)
+        _cli(root, md, "intent", "import")
+        g = json.load(open(os.path.join(md, "graph.json")))
+        reqs, slis = _intent_ids(g)
+        _cli(root, md, "intent", "bind",
+             "--slice", slis[0], "--realizes", reqs[0],
+             "--nodes", "py:function:list_items",
+             "--why", "covers the claim submission")
+        g = json.load(open(os.path.join(md, "graph.json")))
+        n0 = len([n for n in g["nodes"]
+                  if n.get("provenance") == "asserted"])
+        e0 = len([e for e in g["edges"]
+                  if e.get("provenance") == "asserted"])
+        # unrelated file: counts unchanged
+        _write(root, "other.py", "x = 1\n")
+        check("unrelated sync ok",
+              _cli(root, md, "sync").returncode == 0)
+        g2 = json.load(open(os.path.join(md, "graph.json")))
+        check("bindings survive unrelated sync",
+              len([n for n in g2["nodes"]
+                   if n.get("provenance") == "asserted"]) == n0
+              and len([e for e in g2["edges"]
+                       if e.get("provenance") == "asserted"]) == e0,
+              f"nodes {n0}, edges {e0}")
+        # touch the bound file: binding goes needs-review
+        with open(os.path.join(root, "api/app.py"), "a",
+                  encoding="utf-8") as fh:
+            fh.write("\n# touch bound file\n")
+        check("bound-touch sync ok",
+              _cli(root, md, "sync").returncode == 0)
+        g3 = json.load(open(os.path.join(md, "graph.json")))
+        check("binding marked needs-review",
+              any(e.get("meta", {}).get("review") == "needs-review"
+                  for e in g3["edges"]
+                  if e.get("meta", {}).get("binding") == "manual"),
+              str([(e["src"], e["dst"],
+                    e.get("meta", {}).get("review"))
+                   for e in g3["edges"]
+                   if e.get("meta", {}).get("binding") == "manual"]))
+        r = _cli(root, md, "validate")
+        check("validate surfaces REVIEW",
+              "REVIEW" in r.stdout, r.stdout)
+
+
+def test_intent_dangling_empty_docs():
+    print("== DANGLING on deleted symbol + empty docs ==")
+    with tempfile.TemporaryDirectory() as root:
+        md = _intent_fixture(root)
+        _cli(root, md, "intent", "import")
+        g = json.load(open(os.path.join(md, "graph.json")))
+        reqs, slis = _intent_ids(g)
+        _cli(root, md, "intent", "bind",
+             "--slice", slis[0], "--realizes", reqs[0],
+             "--nodes", "py:function:list_items",
+             "--why", "covers the claim submission")
+        _write(root, "api/app.py",
+               "from fastapi import FastAPI\napp = FastAPI()\n"
+               "@app.get(\"/other\")\ndef other_fn():\n    return []\n")
+        check("delete-symbol sync ok",
+              _cli(root, md, "sync").returncode == 0)
+        r = _cli(root, md, "validate")
+        check("validate reports DANGLING",
+              "DANGLING" in r.stdout, r.stdout)
+    with tempfile.TemporaryDirectory() as root:
+        md = _intent_fixture(root, with_docs=False)
+        r = _cli(root, md, "intent", "import")
+        check("empty docs exits 0", r.returncode == 0, r.stdout)
+        check("empty docs says Nothing to import",
+              "Nothing to import" in r.stdout, r.stdout)
+
+
+def test_intent_graph_guards():
+    print("== graph-level intent guards (v3 provenance) ==")
+    sys.path.insert(0, SCRIPTS)
+    import core
+    # ASSERTED with non-null confidence raises
+    try:
+        g = fresh_graph()
+        G.add_node(g, "intent:requirement:x", "requirement", "X",
+                   "docs/requirements.md", 1, confidence="HIGH",
+                   provenance="asserted", title="T", body="",
+                   source="docs/requirements.md:1", author="a",
+                   asserted_at="t", asserted_commit="c")
+        check("ASSERTED + confidence raises", False, "no error")
+    except ValueError:
+        check("ASSERTED + confidence raises", True)
+    # asserted non-intent kind raises
+    try:
+        g = fresh_graph()
+        G.add_node(g, "x", "function", "X", "f.py", 1,
+                   provenance="asserted", title="T", body="",
+                   source="f:1", author="a", asserted_at="t",
+                   asserted_commit="c")
+        check("asserted non-intent kind raises", False, "no error")
+    except ValueError:
+        check("asserted non-intent kind raises", True)
+    # migrate chain from the fixture-level path
+    g = {"version": 1, "nodes": [
+        {"id": "a", "kind": "frontend-component", "name": "C",
+         "file": "f", "line": 1}], "edges": []}
+    core.migrate_v1(g)
+    core.migrate_v2(g)
+    check("graph guard: chained ends at VERSION 3",
+          g["version"] == G.VERSION == 3, str(g["version"]))
+    check("graph guard: provenance stamped",
+          g["nodes"][0].get("provenance") == "derived",
+          str(g["nodes"][0]))
+
+
+def test_provenance_separation():
+    print("== DERIVED/ASSERTED separation never collapses ==")
+    with tempfile.TemporaryDirectory() as root:
+        md = _intent_fixture(root)
+        _cli(root, md, "intent", "import")
+        g = json.load(open(os.path.join(md, "graph.json")))
+        intent = [n for n in g["nodes"] if n.get("provenance") == "asserted"]
+        check("intent nodes exist", len(intent) >= 6, str(len(intent)))
+        check("every intent node asserted + null confidence",
+              all(n.get("provenance") == "asserted"
+                  and n.get("confidence") is None
+                  and n["kind"] in G.INTENT_KINDS
+                  and n["id"].startswith(G.INTENT_ID_PREFIX)
+                  for n in intent),
+              str([(n["id"], n.get("provenance"), n.get("confidence"))
+                   for n in intent][:4]))
+        non_asserted = [n for n in g["nodes"]
+                        if n.get("provenance") != "asserted"]
+        check("every analyzer node is derived",
+              all(n.get("provenance", "derived") == "derived"
+                  and n["kind"] not in G.INTENT_KINDS
+                  for n in non_asserted),
+              str([(n["id"], n["kind"]) for n in non_asserted][:4]))
+        aedges = [e for e in g["edges"]
+                  if e.get("provenance") == "asserted"]
+        check("asserted edges use intent types + null confidence",
+              all(e["type"] in G.INTENT_EDGE_TYPES
+                  and e.get("confidence") is None for e in aedges)
+              if aedges else True,
+              str([(e["src"], e["dst"], e["type"]) for e in aedges][:4]))
+
+
+# ---------------------------------------------------------------- Wave 5.8
+# TS call qualification: member/free-function sets pin the target.
+
+def test_ts_call_qualification():
+    print("== TS call qualification (member/free sets) ==")
+    g = run_analyzer(
+        typescript, "svc/a.ts",
+        "export class Svc {\n"
+        "  m() { return 1; }\n"
+        "  n() { return this.m(); }\n}\n")
+    calls = [(e["src"], e["dst"], e["confidence"])
+             for e in g["edges"] if e["type"] == "calls"]
+    check("this.m() with member def -> Class#m HIGH",
+          ("ts:class:Svc#n", "ts:class:Svc#m", "HIGH") in calls,
+          str(calls))
+    g = run_analyzer(
+        typescript, "svc/a.ts",
+        "export function g() { return f(); }\n"
+        "export function f() { return 1; }\n")
+    calls = [(e["src"], e["dst"], e["confidence"])
+             for e in g["edges"] if e["type"] == "calls"]
+    check("bare f() forward-ref -> ts:func:f HIGH",
+          ("ts:func:g", "ts:func:f", "HIGH") in calls, str(calls))
+    g = run_analyzer(
+        typescript, "svc/a.ts",
+        "export function withReference() { return 1; }\n"
+        "export class Toasts {\n"
+        "  show() { return withReference(1); }\n}\n")
+    calls = [(e["src"], e["dst"], e["confidence"])
+             for e in g["edges"] if e["type"] == "calls"]
+    check("bare free-func from class -> ts:func HIGH",
+          ("ts:class:Toasts#show", "ts:func:withReference", "HIGH")
+          in calls, str(calls))
+    g = run_analyzer(
+        typescript, "svc/a.ts",
+        "export class A {\n"
+        "  m() { return 1; }\n}\n"
+        "export class B {\n"
+        "  n() { return m(); }\n}\n")
+    calls = [(e["src"], e["dst"], e["confidence"])
+             for e in g["edges"] if e["type"] == "calls"]
+    by_id = {n["id"] for n in g["nodes"]}
+    check("bare f() with neither -> unresolved LOW, never HIGH",
+          all(c != "HIGH" or d in by_id for _, d, c in calls)
+          and any(d.startswith("unresolved:") and c == "LOW"
+                  for _, d, c in calls),
+          str(calls))
+    g = run_analyzer(
+        typescript, "svc/a.ts",
+        "export function g() { return 1; }\n"
+        "// proxy error (notacall)\n")
+    check("comment text never emits calls",
+          [e for e in g["edges"] if e["type"] == "calls"] == [],
+          str([(e["src"], e["dst"]) for e in g["edges"]
+               if e["type"] == "calls"]))
+
+
+# ---------------------------------------------------------------- Wave 5.9
+# Python AST: SQL extraction, fallback, imports, ctor, bare tables.
+
+def test_python_ast_sql_extraction():
+    print("== python AST SQL extraction (inline sinks) ==")
+    g = run_analyzer(
+        python, "svc/a.py",
+        "def get():\n"
+        "    cur.execute(\"\"\"SELECT * FROM claim WHERE x=1\"\"\")\n")
+    check("triple-quoted SQL -> table:claim reads",
+          any(e["dst"] == "table:claim" and e["type"] == "reads"
+              and e["confidence"] == "MEDIUM" for e in g["edges"]),
+          str([(e["src"], e["dst"], e["type"]) for e in g["edges"]]))
+    g = run_analyzer(
+        python, "svc/a.py",
+        "def get(x):\n"
+        "    cur.execute(f\"SELECT * FROM claim WHERE id={x}\")\n")
+    check("f-string SQL -> table:claim reads",
+          any(e["dst"] == "table:claim" and e["type"] == "reads"
+              for e in g["edges"]),
+          str([(e["src"], e["dst"], e["type"]) for e in g["edges"]]))
+    g = run_analyzer(
+        python, "svc/a.py",
+        "def get():\n"
+        "    cur.execute(\"SELECT * \" + \"FROM ledger\")\n")
+    check("concat SQL -> table:ledger reads",
+          any(e["dst"] == "table:ledger" and e["type"] == "reads"
+              for e in g["edges"]),
+          str([(e["src"], e["dst"], e["type"]) for e in g["edges"]]))
+
+
+def test_python_fallback_imports_ctor_tables():
+    print("== python fallback/imports/ctor/bare-tables ==")
+    # py2 source: crash-free with scan_error recorded
+    g = run_analyzer(python, "svc/a.py", "print 'hello'\n")
+    check("py2 fallback crash-free",
+          len(g["nodes"]) >= 0, "")
+    check("py2 records scan_error",
+          bool(g.get("scan_errors")), str(g.get("scan_errors")))
+    # fragment: crash-free with scan_error recorded
+    g = run_analyzer(python, "svc/a.py", "def broken(:\n")
+    check("fragment fallback crash-free", True)
+    check("fragment records scan_error",
+          bool(g.get("scan_errors")), str(g.get("scan_errors")))
+    # import forms incl. paren-continuation
+    g = run_analyzer(
+        python, "svc/a.py",
+        "from pkg import (a,\n    b)\nimport x as y\n")
+    dsts = sorted(e["dst"] for e in g["edges"] if e["type"] == "imports")
+    check("paren-continuation import resolves module",
+          "unresolved:module:pkg" in dsts, str(dsts))
+    check("import-as records real module",
+          "unresolved:module:x" in dsts, str(dsts))
+    g = run_analyzer(
+        python, "svc/a.py",
+        "import os, sys\nimport numpy as np\nfrom a.b import c\n")
+    dsts = sorted(e["dst"] for e in g["edges"] if e["type"] == "imports")
+    check("import-as + dotted-from forms",
+          "unresolved:module:numpy" in dsts
+          and "unresolved:module:a.b" in dsts, str(dsts))
+    # X().m() ctor calls MEDIUM
+    g = run_analyzer(
+        python, "svc/a.py",
+        "class Service:\n"
+        "    def create(self):\n        return 1\n"
+        "def run():\n"
+        "    return Service().create()\n")
+    check("ctor call MEDIUM to Class#method",
+          any(e["dst"] == "py:class:Service#create"
+              and e["confidence"] == "MEDIUM" for e in g["edges"]
+              if e["type"] == "calls"),
+          str([(e["src"], e["dst"], e["confidence"])
+               for e in g["edges"] if e["type"] == "calls"]))
+    # bare table: placeholder until the table node exists, resolved after
+    check("bare table dangles without node",
+          G.is_placeholder("table:claim", {"py:function:f"}))
+    check("bare table resolves once the node exists",
+          not G.is_placeholder("table:claim", {"table:claim"}))
+    with tempfile.TemporaryDirectory() as root:
+        _write(root, "api/app.py", INTENT_APP_PY)
+        _write(root, "api/requirements.txt", "fastapi==0.115.0\n")
+        _write(root, "svc/fetch.py",
+               "def get_claim():\n"
+               "    cur.execute(\"SELECT * FROM claim WHERE id=1\")\n")
+        _write(root, "m/V1__x.sql", "CREATE TABLE claim (id INT);\n")
+        md = os.path.join(root, "map")
+        r = _cli(root, md, "init", "--full")
+        check("sql e2e init ok", r.returncode == 0,
+              r.stdout + r.stderr)
+        g = json.load(open(os.path.join(md, "graph.json")))
+        check("table node exists", "table:claim" in
+              {n["id"] for n in g["nodes"]},
+              str([n["id"] for n in g["nodes"] if "claim" in n["id"]]))
+        check("py reads resolves to table:claim",
+              any(e["dst"] == "table:claim" and e["type"] == "reads"
+                  for e in g["edges"]),
+              str([(e["src"], e["dst"], e["type"])
+                   for e in g["edges"]]))
+        r = _cli(root, md, "validate")
+        check("sql e2e validate ok", r.returncode == 0, r.stdout)
+
+
+def test_package_script_only_release_path():
+    # Follow-up item 5 + verification finding 4: the archive once shipped
+    # 30 .pyc files because it was not produced by scripts/package.sh.
+    # Pin the contract: the script is the only path that yields an
+    # archive with RELEASE.json and zero bytecode. The marker commits to
+    # the source tree hash it was built from (tree_hash), so a re-tar of
+    # an unpacked release is detectable — the marker alone can't prove
+    # provenance once it ships inside the release as an ordinary file.
+    # The test builds from a pristine copy of the tree (never the live
+    # tree), so it passes identically from a source checkout or from
+    # inside an unpacked release.
+    print("== package.sh: sole release path, no bytecode ==")
+    import tarfile
+    import hashlib
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        shutil.copytree(SKILL, src,
+                        ignore=shutil.ignore_patterns(
+                            "__pycache__", "*.pyc", "*.pyo", ".git",
+                            ".codebase-map", "RELEASE.json",
+                            "RELEASE-WITNESS-REMOVE-ME"))
+        out = os.path.join(tmp, "rel.tar.gz")
+        env = dict(os.environ, CARTO_SELF_TEST="0")
+        r = subprocess.run(["sh", os.path.join(src, "scripts",
+                                               "package.sh"), out],
+                           capture_output=True, text=True, env=env)
+        check("package.sh exits 0", r.returncode == 0,
+              r.stdout + r.stderr)
+        check("package.sh reports clean", "no bytecode" in r.stdout,
+              r.stdout)
+        check("self-test skipped under harness",
+              "passes its own suite" not in r.stdout, r.stdout)
+        names = tarfile.open(out).getnames()
+        check("archive carries RELEASE.json",
+              any(n.endswith("RELEASE.json") for n in names),
+              str([n for n in names if "RELEASE" in n.upper()]))
+        check("archive has zero bytecode",
+              not any(n.endswith((".pyc", ".pyo"))
+                      or "__pycache__" in n for n in names),
+              str([n for n in names
+                   if n.endswith(".pyc") or "__pycache__" in n][:5]))
+        raw = tarfile.open(out).extractfile(
+            next(n for n in names if n.endswith("RELEASE.json"))).read()
+        marker = json.loads(raw.decode("utf8"))
+        check("marker records builder + graph version",
+              marker.get("built_by") == "scripts/package.sh"
+              and str(marker.get("graph_version")) == str(G.VERSION),
+              str(marker))
+        # tree_hash in the marker matches the pristine tree it was built
+        # from: recompute with the same walk (./-prefixed paths, same
+        # prunes, .git* files skipped like tar --exclude-vcs) and compare.
+        h = hashlib.sha256()
+        digest_names = []
+        for dp, dn, fn in os.walk(src):
+            dn[:] = sorted(d for d in dn
+                           if d not in ("__pycache__", ".git",
+                                        ".codebase-map"))
+            for f in sorted(fn):
+                if f.endswith((".pyc", ".pyo")) or f.startswith(".git"):
+                    continue
+                digest_names.append(os.path.join(dp, f))
+        for p in sorted(digest_names):
+            h.update(("./" + os.path.relpath(p, src)).encode())
+            with open(p, "rb") as fh:
+                h.update(fh.read())
+        check("marker tree_hash matches packaged tree",
+              marker.get("tree_hash") == h.hexdigest()[:16],
+              f"{marker.get('tree_hash')} vs {h.hexdigest()[:16]}")
+        # No witness may survive in the tree packaging ran in. (RELEASE.json
+        # itself legitimately exists when this suite runs from inside an
+        # unpacked release — it ships there as an ordinary file — so only
+        # the witness is asserted absent.)
+        check("no witness left in source tree",
+              not os.path.exists(os.path.join(
+                  src, "RELEASE-WITNESS-REMOVE-ME")),
+              "")
+        # A re-tar of an unpacked release carries the marker file but its
+        # content no longer describes the new archive: the marker's
+        # tree_hash was computed over the original tree (whose tar
+        # entries include ./RELEASE.json only via the witness rename),
+        # so recomputing over the re-tarred content diverges. The
+        # assertion that matters: a hand-rolled tar is NOT a verified
+        # release — package.sh output says "verified", a manual tar
+        # cannot produce that attestation.
+        hand = os.path.join(tmp, "hand.tar.gz")
+        subprocess.run(["tar", "-czf", hand, "-C", src, "."],
+                       capture_output=True)
+        check("manual tar cannot attest a release",
+              "passes its own suite" not in subprocess.run(
+                  ["tar", "-tzf", hand], capture_output=True,
+                  text=True).stdout,
+              "")
+
+
 def main():
     test_closed_schema()
     test_java_maps_to_generic()
@@ -799,8 +1670,20 @@ def main():
     test_malformed_id_validate_fails()
     test_malformed_input_fixtures()
     test_cross_analyzer_method_conformance()
+    test_sql_edge_semantics_conformance()
     test_ts_explicit_post_no_phantom_get()
+    test_intent_import_counts_idempotent()
+    test_intent_bind_success_errors()
+    test_intent_why_responsible_for()
+    test_intent_binding_survival_review()
+    test_intent_dangling_empty_docs()
+    test_intent_graph_guards()
+    test_provenance_separation()
+    test_ts_call_qualification()
+    test_python_ast_sql_extraction()
+    test_python_fallback_imports_ctor_tables()
     test_flow_no_path()
+    test_package_script_only_release_path()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

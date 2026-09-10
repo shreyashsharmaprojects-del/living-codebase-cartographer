@@ -1074,9 +1074,13 @@ def cmd_sync(args):
               "preserving curated files.")
         args.full = True
         return cmd_init(args)
-    # Migrate v1 graphs: tech-specific kinds map into the generic schema.
-    if graph.get("version", 1) < VERSION:
+    # Migrate older graphs: v1 tech-specific kinds -> generic schema,
+    # then v2 -> v3 provenance stamping. Intent (ASSERTED) entries always
+    # carry provenance explicitly, so migrate_v2 only fills the default.
+    if graph.get("version", 1) < 2:
         graph = migrate_v1(graph)
+    if graph.get("version", 1) < VERSION:
+        graph = migrate_v2(graph)
     old_n, old_e = snapshot_ids(graph)
     commit = head_commit(root)
     base = graph.get("last_sync_commit")
@@ -1121,9 +1125,20 @@ def cmd_sync(args):
                           and e["src"] not in bad_n and e["dst"] not in bad_n]
         print(f"Sync: dropped {len(bad_n)} malformed node IDs and "
               f"{len(bad_e)} malformed edges (stale pre-fix corruption).")
+    # Provenance guard (Wave 4a, intent-layer survival): the purge below
+    # drops every node/edge file-attributed to a rescanned path. Intent
+    # (ASSERTED) entries are never file-attributed to scanned sources —
+    # their `file` is a docs/*.md path — but a belt-and-suspenders guard
+    # keeps any asserted entry regardless of its file value, so a future
+    # caller can never silently purge curated intent.
+    intent_nodes = [n for n in graph["nodes"] if G.is_asserted(n)]
+    intent_node_ids = {n["id"] for n in intent_nodes}
+    intent_edges = [e for e in graph["edges"] if G.is_asserted(e)]
     # changed file -> detect analyzer -> rescan file -> update generic graph
-    graph["nodes"] = [n for n in graph["nodes"] if n["file"] not in relevant]
-    graph["edges"] = [e for e in graph["edges"] if e["file"] not in relevant]
+    graph["nodes"] = [n for n in graph["nodes"]
+                      if n["file"] not in relevant or G.is_asserted(n)]
+    graph["edges"] = [e for e in graph["edges"]
+                      if e["file"] not in relevant or G.is_asserted(e)]
     tracked = {rel for rel, _ in iter_repo_files(
         root, load_gitignore_basenames(root), args.map_dir)}
     new_hashes = {k: v for k, v in old_hashes.items() if k not in relevant}
@@ -1149,6 +1164,17 @@ def cmd_sync(args):
                 f"detection refresh: {exc}")
     resolve_references(graph)
     compute_flow_candidates(graph)
+    # Honesty as code moves (5.5 subset): every binding stores
+    # asserted_commit at bind time. When a bound code node was rescanned
+    # (materially changed) or deleted, mark the binding needs-review with
+    # the reason recorded — surface in validate, never silently kept.
+    intent_nodes = [n for n in graph.get("nodes", [])
+                    if G.is_asserted(n)]
+    intent_node_ids = {n["id"] for n in intent_nodes}
+    intent_edges = [e for e in graph.get("edges", [])
+                    if G.is_asserted(e)]
+    if intent_nodes or intent_edges:
+        _mark_bindings_review(graph, intent_edges, relevant, commit)
     graph["last_sync_commit"] = commit
     graph["last_sync_time"] = utcnow()
     new_n, new_e = snapshot_ids(graph)
@@ -1216,9 +1242,900 @@ def migrate_v1(graph):
         n["kind"] = V1_KIND_MAP.get(n["kind"], n["kind"])
     for e in graph["edges"]:
         e["type"] = V1_EDGE_MAP.get(e["type"], e["type"])
-    graph["version"] = VERSION
+    graph["version"] = 2
     graph.setdefault("detection", {})
     return graph
+
+
+def migrate_v2(graph):
+    """v2 -> v3: stamp provenance on every node/edge.
+
+    Pre-4a entries predate the provenance field; absent means derived, so
+    stamping the default preserves semantics exactly while making the
+    sync-purge guard (`is_asserted`) and validate's intent checks total.
+    One-way, preserves curated files; chained after migrate_v1 by cmd_sync
+    and the intent commands."""
+    for n in graph.get("nodes", []):
+        n.setdefault("provenance", "derived")
+    for e in graph.get("edges", []):
+        e.setdefault("provenance", "derived")
+    graph["version"] = VERSION
+    return graph
+
+
+def load_graph_migrated(paths, save=False):
+    """Load graph.json, applying pending migrations (v1->v2->v3).
+
+    Used by the intent commands so they work on a freshly-synced map
+    without forcing `init --full`. Returns (graph, migrated_bool); when
+    save=True the migrated graph is written back."""
+    with open(paths["graph"], encoding="utf-8") as fh:
+        graph = json.load(fh)
+    migrated = False
+    if graph.get("version", 1) < 2:
+        graph = migrate_v1(graph)
+        migrated = True
+    if graph.get("version", 1) < VERSION:
+        graph = migrate_v2(graph)
+        migrated = True
+    if migrated and save:
+        save_graph(paths, graph)
+    return graph, migrated
+
+
+# --------------------------------------------------------------------------
+# Intent layer (Wave 4a): ASSERTED human/agent claims over DERIVED code map.
+#
+# Single source of truth: docs/*.md remain authoritative; the graph holds a
+# parsed projection. `intent import` syncs docs->graph only; docs win on
+# disagreement (re-import overwrites the parsed projection fields, never
+# hand-added bindings). No LLM-based extraction anywhere: intent is
+# ASSERTED by humans/agents, never inferred — the parser below matches
+# explicit Markdown structure (headings, bullets) deterministically.
+# --------------------------------------------------------------------------
+
+# docs/*.md sources parsed by `intent import`. Missing docs = clean
+# "nothing to import", exit 0 — never an error.
+INTENT_DOCS = ("docs/requirements.md", "docs/plan.md", "docs/decisions.md")
+
+# Author recorded on import-created nodes/edges: the import is a mechanical
+# projection, so the author is the docs themselves. Bind-created entries
+# carry the --author flag (default below) since a human/agent asserts them.
+IMPORT_AUTHOR = "intent-import(docs)"
+
+# "- [ ] ..." acceptance-criteria bullets under a Flow heading.
+ACCEPTANCE_RE = re.compile(r"^-\s*\[[ xX]\]\s*(.+)$")
+# "- Not building: **title** — body" non-goal bullets.
+NON_GOAL_RE = re.compile(r"^-\s*not building:\s*\*{0,2}(.+?)\*{0,2}"
+                         r"\s*[—\-–:]\s*(.+)$", re.IGNORECASE)
+# Generic non-goal bullets under "Out of scope" ("- Reopening/appeals ...").
+GENERIC_BULLET_RE = re.compile(r"^-\s*(.+)$")
+# plan.md data-model fence entries: "  claim\n    id PK, ..." or
+# "  policy (seeded, read-only)\n    id PK, ...".
+DATA_MODEL_ENTRY_RE = re.compile(r"^([A-Za-z][\w]*)\s*(\(.*\))?\s*$")
+# requirements.md data table rows: "| Policy | key fields | ... |".
+DATA_TABLE_ROW_RE = re.compile(r"^\|\s*([^|]+?)\s*\|")
+# decisions.md "Deliberately not built" / "Not built" bullets -> non-goals.
+NOT_BUILT_RE = re.compile(r"deliberately not built|not built", re.IGNORECASE)
+
+# Bind-created edge keys: import only creates/updates nodes + part-of
+# slice edges parsed from docs; bindings created by `intent bind` are keyed
+# separately (meta.binding == "manual") and preserved across re-imports.
+BINDING_MARK = "manual"
+IMPORT_MARK = "import"
+
+
+def _slug(text, max_words=8):
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    slug = "-".join(words[:max_words]).strip("-")
+    return slug or "item"
+
+
+def _parse_md_sections(text):
+    """Split Markdown into (level, title, body_lines, lineno) sections.
+
+    Deterministic: headings `#{1,6} title`; everything else is body. Only
+    `##`/`###` headings drive intent rules; other levels are context."""
+    sections = []
+    current = None
+    for i, raw in enumerate(text.splitlines(), start=1):
+        m = re.match(r"^(#{1,6})\s+(.*?)\s*$", raw)
+        if m:
+            if current is not None:
+                sections.append(current)
+            current = {"level": len(m.group(1)), "title": m.group(2),
+                       "body": [], "lineno": i}
+        elif current is not None:
+            current["body"].append((i, raw))
+    if current is not None:
+        sections.append(current)
+    return sections
+
+
+def _code_fences(body_lines):
+    """Yield (fence_body_lines, start_lineno) for ``` fenced blocks."""
+    in_fence = False
+    buf = []
+    start = 0
+    for lineno, raw in body_lines:
+        if raw.strip().startswith("```"):
+            if in_fence:
+                yield buf, start
+                buf = []
+                in_fence = False
+            else:
+                in_fence = True
+                start = lineno
+        elif in_fence:
+            buf.append((lineno, raw))
+    # Unterminated fence: ignore (deterministic, never half-parse).
+
+
+def parse_intent_docs(root, docs=INTENT_DOCS):
+    """Parse docs/*.md into intent node/edge specs (pure function).
+
+    Returns (nodes, edges) where each node is a dict with
+    id/kind/name/title/body/source/file/line/author and each edge has
+    src/dst/type/file/line. Ids are stable slugs: re-running on unchanged
+    docs yields identical ids (idempotency key). No graph I/O, no LLM —
+    headings + bullets only.
+
+    Mapping:
+      requirements.md `### Flow N — <t>` -> capability `intent:capability:flow-N-<slug>`
+        `- [ ] <criterion>` bullets -> requirement
+          `intent:requirement:flow-N-<k>-<slug>`, part-of the capability.
+      requirements.md `## Data` table rows + plan.md `## Data model` fence
+        entries -> concept `intent:concept:<slug>`.
+      requirements.md `## Non-goals` ("- Not building: **T** — B") +
+        plan.md `## Out of scope` bullets +
+        decisions.md "**Deliberately not built ...:** a, b" bullets ->
+        non-goal `intent:non-goal:<slug>` (nodes only, no edges).
+      plan.md `### Slice N — <t>` -> slice `intent:slice:slice-N-<slug>`,
+        part-of the capabilities its "- Satisfies: Flow N ..." line names
+        (parsed from explicit `Flow <N>` references only — never inferred).
+      plan.md `### <fork>` under `## Resolved forks` -> concept
+        `intent:concept:fork-<slug>`.
+      decisions.md `### <date> — <title>` -> decision
+        `intent:decision:<date>-<slug>`; `- Satisfies/Plan: ... slice S..`
+        cross-refs are ignored (bindings come from `intent bind` only).
+    """
+    nodes = []
+    edges = []
+    seen = set()
+
+    def emit_node(nid, kind, name, title, body, doc_rel, lineno):
+        if nid in seen:
+            return None
+        seen.add(nid)
+        node = {"id": nid, "kind": kind, "name": name, "title": title,
+                "body": body, "file": doc_rel, "line": lineno,
+                "source": f"{doc_rel}:{lineno}", "author": IMPORT_AUTHOR}
+        nodes.append(node)
+        return node
+
+    def emit_edge(src, dst, etype, doc_rel, lineno):
+        key = (src, dst, etype)
+        if key in seen:
+            return
+        seen.add(key)
+        edges.append({"src": src, "dst": dst, "type": etype,
+                      "file": doc_rel, "line": lineno})
+
+    for doc_rel in docs:
+        ap = os.path.join(root, doc_rel)
+        try:
+            with open(ap, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue  # missing docs: skipped; caller reports "nothing"
+        base = os.path.basename(doc_rel)
+        sections = _parse_md_sections(text)
+        for idx, sec in enumerate(sections):
+            title = sec["title"]
+            level = sec["level"]
+            # --- requirements.md flows -> capabilities + requirements ---
+            if base == "requirements.md" and level == 3:
+                m = re.match(r"^flow\s+(\d+)\s*[—\-–:]\s*(.+)$", title,
+                             re.IGNORECASE)
+                if m:
+                    num, cap_title = m.group(1), m.group(2).strip()
+                    cid = (f"{G.INTENT_ID_PREFIX}capability:"
+                           f"flow-{num}-{_slug(cap_title)}")
+                    body = "\n".join(
+                        r for _, r in sec["body"] if r.strip())
+                    emit_node(cid, "capability",
+                              f"Flow {num} — {cap_title}", cap_title,
+                              body, doc_rel, sec["lineno"])
+                    k = 0
+                    for lineno, raw in sec["body"]:
+                        am = ACCEPTANCE_RE.match(raw.strip())
+                        if am:
+                            k += 1
+                            crit = am.group(1).strip()
+                            rid = (f"{G.INTENT_ID_PREFIX}requirement:"
+                                   f"flow-{num}-{k}-{_slug(crit)}")
+                            emit_node(rid, "requirement", crit, crit,
+                                      "", doc_rel, lineno)
+                            emit_edge(rid, cid, "part-of", doc_rel, lineno)
+                    continue
+            # --- non-goal sections (requirements + plan) ---
+            if level == 2 and re.match(r"^(non-?goals|out of scope)",
+                                       title, re.IGNORECASE):
+                for lineno, raw in sec["body"]:
+                    s = raw.strip()
+                    if not s.startswith("-"):
+                        continue
+                    nm = NON_GOAL_RE.match(s)
+                    if nm:
+                        ng_title, ng_body = nm.group(1).strip(), \
+                            nm.group(2).strip()
+                    else:
+                        gm = GENERIC_BULLET_RE.match(s)
+                        if not gm or len(gm.group(1)) < 8:
+                            continue
+                        ng_title, ng_body = gm.group(1).strip(), ""
+                    nid = (f"{G.INTENT_ID_PREFIX}non-goal:"
+                           f"{_slug(ng_title)}")
+                    emit_node(nid, "non-goal", ng_title, ng_title,
+                              ng_body, doc_rel, lineno)
+                continue
+            # --- requirements.md data table -> concepts ---
+            if base == "requirements.md" and level == 2 \
+                    and title.strip().lower() == "data":
+                for lineno, raw in sec["body"]:
+                    tm = DATA_TABLE_ROW_RE.match(raw.strip())
+                    if tm:
+                        cell = tm.group(1).strip().strip("*")
+                        if cell.lower() in ("entity",):
+                            continue  # header row
+                        if re.match(r"^-+$", cell):
+                            continue  # separator row
+                        nid = (f"{G.INTENT_ID_PREFIX}concept:"
+                               f"{_slug(cell)}")
+                        emit_node(nid, "concept", cell, cell, "",
+                                  doc_rel, lineno)
+                continue
+            # --- plan.md data model fence -> concepts ---
+            if base == "plan.md" and level == 2 \
+                    and title.strip().lower() == "data model":
+                for fence, start in _code_fences(sec["body"]):
+                    for lineno, raw in fence:
+                        if not raw or raw[:1].isspace():
+                            continue  # indented detail line, not an entry
+                        dm = DATA_MODEL_ENTRY_RE.match(raw.strip())
+                        if dm:
+                            entry = dm.group(1).strip()
+                            if len(entry) >= 2:
+                                nid = (f"{G.INTENT_ID_PREFIX}concept:"
+                                       f"{_slug(entry)}")
+                                emit_node(nid, "concept", entry, entry,
+                                          (dm.group(2) or "").strip("()"),
+                                          doc_rel, lineno)
+                continue
+            # --- plan.md slices -> slice nodes + part-of capabilities ---
+            if base == "plan.md" and level == 3:
+                m = re.match(r"^slice\s+(\d+)\s*[—\-–:]\s*(.+)$", title,
+                             re.IGNORECASE)
+                if m:
+                    num, sl_title = m.group(1), m.group(2).strip()
+                    sid = (f"{G.INTENT_ID_PREFIX}slice:"
+                           f"slice-{num}-{_slug(sl_title)}")
+                    body = "\n".join(
+                        r for _, r in sec["body"] if r.strip())
+                    emit_node(sid, "slice", f"Slice {num} — {sl_title}",
+                              sl_title, body, doc_rel, sec["lineno"])
+                    # Explicit "Flow N" refs in the Satisfies line only.
+                    # Target id must match the capability id shape the
+                    # requirements parser emits
+                    # (intent:capability:flow-N-<slug>); resolve by prefix
+                    # match against parsed capabilities.
+                    for lineno, raw in sec["body"]:
+                        if "satisfies" in raw.lower():
+                            for fn in sorted(set(re.findall(
+                                    r"flow\s+(\d+)", raw,
+                                    re.IGNORECASE))):
+                                prefix = (f"{G.INTENT_ID_PREFIX}"
+                                          f"capability:flow-{fn}-")
+                                for cand in nodes:
+                                    if cand["kind"] == "capability" \
+                                            and cand["id"].startswith(
+                                                prefix):
+                                        emit_edge(sid, cand["id"],
+                                                  "part-of", doc_rel,
+                                                  lineno)
+                    continue
+                # Resolved forks (concept nodes) — only inside plan.md's
+                # "## Resolved forks" section (previous ## fa-level check:
+                # nearest preceding level-2 heading must be Resolved forks).
+                prev_l2 = None
+                for prev in sections[:idx][::-1]:
+                    if prev["level"] == 2:
+                        prev_l2 = prev["title"]
+                        break
+                if prev_l2 and prev_l2.strip().lower() == "resolved forks":
+                    fork_title = title.strip()
+                    if len(fork_title) >= 4:
+                        nid = (f"{G.INTENT_ID_PREFIX}concept:"
+                               f"fork-{_slug(fork_title)}")
+                        body = "\n".join(
+                            r for _, r in sec["body"] if r.strip())
+                        emit_node(nid, "concept", fork_title, fork_title,
+                                  body, doc_rel, sec["lineno"])
+                    continue
+            # --- decisions.md entries -> decision nodes + non-goals ---
+            if base == "decisions.md" and level == 3:
+                m = re.match(r"^(\d{4}-\d{2}-\d{2})\s*[—\-–]\s*(.+)$",
+                             title)
+                if m:
+                    date, d_title = m.group(1), m.group(2).strip()
+                    did = (f"{G.INTENT_ID_PREFIX}decision:"
+                           f"{date}-{_slug(d_title)}")
+                    body = "\n".join(
+                        r for _, r in sec["body"] if r.strip())
+                    emit_node(did, "decision", d_title, d_title, body,
+                              doc_rel, sec["lineno"])
+                    for lineno, raw in sec["body"]:
+                        if NOT_BUILT_RE.search(raw):
+                            # "**Deliberately not built (Non-goals):** a, b."
+                            items = re.split(r"[:,;]", raw, maxsplit=1)
+                            tail = items[-1] if len(items) > 1 else raw
+                            tail = re.sub(r"\*+", "", tail).strip().rstrip(
+                                ".")
+                            for item in re.split(r";", tail):
+                                item = item.strip()
+                                if len(item) >= 4:
+                                    nid = (f"{G.INTENT_ID_PREFIX}"
+                                           f"non-goal:{_slug(item)}")
+                                    emit_node(nid, "non-goal", item, item,
+                                              "", doc_rel, lineno)
+                    continue
+    return nodes, edges
+
+
+def _intent_binding_edges(graph):
+    """Asserted intent edges created by `intent bind` (preserved on import)."""
+    return [e for e in graph.get("edges", [])
+            if G.is_asserted(e)
+            and e.get("meta", {}).get("binding") == BINDING_MARK]
+
+
+def cmd_intent_import(args):
+    """`intent import` — parse docs/*.md into intent nodes (ASSERTED).
+
+    Idempotent and re-runnable: re-import updates the parsed-projection
+    fields (title/body/source) of import-owned nodes, never overwrites
+    hand-added bindings (`meta.binding == "manual"` edges are preserved),
+    and creates nothing twice (stable slug ids). Missing docs = clean
+    "nothing to import", exit 0."""
+    root = os.path.abspath(args.root)
+    paths = map_paths(root, args.map_dir)
+    if not os.path.exists(paths["graph"]):
+        print("STATUS: NO_MAP — run `init` first.")
+        return 1
+    try:
+        graph, migrated = load_graph_migrated(paths, save=True)
+    except (OSError, ValueError) as exc:
+        print(f"STATUS: CORRUPT — graph.json unreadable ({exc}); "
+              "run `init --full` to rebuild.")
+        return 2
+    if migrated:
+        print(f"Map migrated to schema v{VERSION}.")
+    commit = head_commit(root)
+    now = utcnow()
+    nodes, edges = parse_intent_docs(root)
+    if not nodes and not edges:
+        print("Nothing to import: docs/requirements.md, docs/plan.md and "
+              "docs/decisions.md are all missing or have no parseable "
+              "intent sections.")
+        return 0
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    created_n = updated_n = 0
+    for spec in nodes:
+        existing = by_id.get(spec["id"])
+        if existing is None:
+            G.add_node(graph, spec["id"], spec["kind"], spec["name"],
+                       spec["file"], spec["line"], confidence=None,
+                       provenance="asserted", title=spec["title"],
+                       body=spec["body"], source=spec["source"],
+                       author=spec["author"], asserted_at=now,
+                       asserted_commit=commit, status="active",
+                       meta={"binding": IMPORT_MARK})
+            created_n += 1
+        elif G.is_asserted(existing):
+            # Docs win on disagreement: refresh the parsed projection.
+            # A superseded/needs-review status is sticky — re-import of
+            # identical docs never clears human review state.
+            existing["name"] = spec["name"]
+            existing["title"] = spec["title"]
+            existing["body"] = spec["body"]
+            existing["source"] = spec["source"]
+            existing["file"] = spec["file"]
+            existing["line"] = spec["line"]
+            existing["asserted_commit"] = commit
+            existing["meta"]["binding"] = IMPORT_MARK
+            updated_n += 1
+        # else: a DERIVED node somehow owns the id — impossible by prefix,
+        # but never clobber it; skip deterministically.
+    created_e = 0
+    edge_keys = {(e["src"], e["dst"], e["type"])
+                 for e in graph["edges"]}
+    for spec in edges:
+        if (spec["src"], spec["dst"], spec["type"]) in edge_keys:
+            continue
+        if spec["src"] not in {n["id"] for n in graph["nodes"]}:
+            continue  # slice references a capability not in docs: skip
+        if spec["dst"] not in {n["id"] for n in graph["nodes"]}:
+            continue
+        G.add_edge(graph, spec["src"], spec["dst"], spec["type"],
+                   spec["file"], spec["line"], confidence=None,
+                   provenance="asserted", author=IMPORT_AUTHOR,
+                   asserted_at=now, asserted_commit=commit,
+                   meta={"binding": IMPORT_MARK})
+        created_e += 1
+    save_graph(paths, graph)
+    print(f"Intent import: {created_n} node(s) created, {updated_n} "
+          f"updated, {created_e} edge(s) created "
+          f"({len(_intent_binding_edges(graph))} manual binding(s) "
+          f"preserved).")
+    return 0
+
+
+def _resolve_code_node(graph, text):
+    """Resolve a --nodes entry to a graph node id.
+
+    Accepts an exact node id or a name/id substring (same matching as
+    find_nodes). Raises LookupError when nothing matches; on ambiguous
+    matches the first id-sorted hit wins deterministically and the caller
+    reports it."""
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    if text in by_id:
+        return by_id[text], False
+    hits = sorted(find_nodes(graph, text), key=lambda n: n["id"])
+    if not hits:
+        raise LookupError(f"unknown code node: '{text}'")
+    return hits[0], len(hits) > 1
+
+
+def cmd_intent_bind(args):
+    """`intent bind` — programmatic write path: attach code nodes to intent.
+
+    `intent bind --slice <name> --realizes <req-id>
+    --nodes <id> [<id>...] [--nodes <id>...]
+    --why <text> [--author <name>] [--decision <decision-id>]
+    [--declares-files <paths...>]`
+
+    `--nodes` is variadic and repeatable: space-separated ids, the legacy
+    comma-separated form, or repeated flags all bind the union.
+
+    `--declares-files` records the step-1 pre-implementation file
+    declaration (workflow skill 04-slice capture hook) verbatim on every
+    binding edge; re-binding with it updates the stored record, re-binding
+    without it preserves the record. Never validated against the tree —
+    declaration precedes code.
+
+    Creates realizes (code->requirement/capability) and delivered-in
+    (code->slice) edges plus motivated-by (code/slice->decision) where
+    --decision is given. Never requires hand-editing Markdown. Validates
+    that both the intent ids and the code node ids exist (error +
+    non-zero exit otherwise). Stores asserted_commit on every binding."""
+    root = os.path.abspath(args.root)
+    paths = map_paths(root, args.map_dir)
+    if not os.path.exists(paths["graph"]):
+        print("STATUS: NO_MAP — run `init` first.")
+        return 1
+    try:
+        graph, migrated = load_graph_migrated(paths, save=True)
+    except (OSError, ValueError) as exc:
+        print(f"STATUS: CORRUPT — graph.json unreadable ({exc}); "
+              "run `init --full` to rebuild.")
+        return 2
+    if migrated:
+        print(f"Map migrated to schema v{VERSION}.")
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    # --- validate intent ids exist and are intent nodes ---
+    problems = []
+    slice_hits = sorted(find_nodes(graph, args.slice),
+                        key=lambda n: n["id"])
+    slice_node = None
+    if args.slice in by_id:
+        slice_node = by_id[args.slice]
+    elif len(slice_hits) == 1:
+        slice_node = slice_hits[0]
+    elif len(slice_hits) > 1:
+        intent_hits = [n for n in slice_hits if G.is_asserted(n)]
+        slice_node = intent_hits[0] if len(intent_hits) == 1 else None
+        if slice_node is None:
+            problems.append(
+                f"ambiguous --slice '{args.slice}': matches "
+                f"{len(slice_hits)} nodes "
+                f"({', '.join(n['id'] for n in slice_hits[:5])}); "
+                f"pass an exact intent id")
+    if slice_node is None and not any("slice" in p for p in problems):
+        problems.append(f"unknown --slice '{args.slice}': no intent node "
+                        f"with that id or name (run `intent import` first)")
+    elif slice_node is not None and not G.is_asserted(slice_node):
+        problems.append(f"--slice '{args.slice}' resolves to a DERIVED "
+                        f"code node [{slice_node['id']}]; bind needs an "
+                        f"intent slice/requirement/capability id")
+    req_node = by_id.get(args.realizes)
+    if req_node is None:
+        hits = sorted(find_nodes(graph, args.realizes),
+                      key=lambda n: n["id"])
+        intent_hits = [n for n in hits if G.is_asserted(n)]
+        if len(intent_hits) == 1:
+            req_node = intent_hits[0]
+        else:
+            problems.append(
+                f"unknown --realizes '{args.realizes}': no intent node "
+                f"with that id or name (run `intent import` first)")
+    elif not G.is_asserted(req_node):
+        problems.append(f"--realizes '{args.realizes}' resolves to a "
+                        f"DERIVED code node [{req_node['id']}]; bind needs "
+                        f"an intent requirement/capability id")
+    dec_node = None
+    if args.decision:
+        dec_node = by_id.get(args.decision)
+        if dec_node is None:
+            problems.append(f"unknown --decision '{args.decision}': no "
+                            f"intent node with that id")
+        elif not G.is_asserted(dec_node):
+            problems.append(f"--decision '{args.decision}' is a DERIVED "
+                            f"code node; bind needs an intent decision id")
+    # --- validate code node ids exist ---
+    # --nodes is variadic (space-separated); each entry may itself be
+    # comma-separated (legacy single-value form). Both spellings bind the
+    # union — repeated --nodes flags accumulate via action="append", never
+    # silently keep only the last.
+    code_nodes = []
+    raw_entries = []
+    for group in args.nodes:
+        # action="append" + nargs="+" nests one level: each group is the
+        # list of tokens from one --nodes occurrence.
+        tokens = group if isinstance(group, list) else [group]
+        for tok in tokens:
+            raw_entries.extend(tok.split(","))
+    for raw in raw_entries:
+        text = raw.strip()
+        if not text:
+            continue
+        try:
+            node, ambiguous = _resolve_code_node(graph, text)
+        except LookupError as exc:
+            problems.append(str(exc))
+            continue
+        if G.is_asserted(node):
+            problems.append(f"'{text}' resolves to an intent node "
+                            f"[{node['id']}]; --nodes needs code nodes")
+            continue
+        code_nodes.append((node, ambiguous))
+    if not code_nodes and not problems:
+        problems.append("no --nodes entries: pass at least one code node "
+                        "id or name")
+    if not args.why or not args.why.strip():
+        problems.append("missing --why: a plain-language reason is required")
+    if problems:
+        for p in problems:
+            print(f"ERROR: {p}")
+        return 1
+    # --- write bindings (idempotent: same src/dst/type reuses the edge) ---
+    commit = head_commit(root)
+    now = utcnow()
+    author = args.author or "agent"
+    # --declares-files: the step-1 pre-implementation file declaration
+    # (workflow skill 04-slice capture hook). Stored verbatim on every
+    # binding edge from this invocation; the deferred `drift` command
+    # compares this set against actually-changed files. Pure record —
+    # never validated against the tree (declaration precedes code).
+    declared = getattr(args, "declares_files", None) or []
+    if isinstance(declared, str):
+        declared = [declared]
+    declared = [d.strip() for d in declared if d and d.strip()]
+    made = 0
+    for node, ambiguous in code_nodes:
+        for etype, target in (("realizes", req_node),
+                              ("delivered-in", slice_node)):
+            key = (node["id"], target["id"], etype)
+            exists = any((e["src"], e["dst"], e["type"]) == key
+                         for e in graph["edges"])
+            edge_meta = {"binding": BINDING_MARK,
+                         "why": args.why.strip()}
+            if declared:
+                edge_meta["declares_files"] = declared
+            edge = G.add_edge(graph, node["id"], target["id"], etype,
+                              node.get("file") or target.get("file"),
+                              node.get("line"), confidence=None,
+                              provenance="asserted", author=author,
+                              asserted_at=now, asserted_commit=commit,
+                              meta=edge_meta)
+            if exists and declared:
+                # Re-bind with a declaration updates the stored record:
+                # the step-1 declaration is the highest-value capture and
+                # must never be silently dropped by idempotent reuse.
+                edge.setdefault("meta", {})["declares_files"] = declared
+            if not exists:
+                made += 1
+        if dec_node is not None:
+            key = (node["id"], dec_node["id"], "motivated-by")
+            exists = any((e["src"], e["dst"], e["type"]) == key
+                         for e in graph["edges"])
+            G.add_edge(graph, node["id"], dec_node["id"], "motivated-by",
+                       node.get("file") or dec_node.get("file"),
+                       node.get("line"), confidence=None,
+                       provenance="asserted", author=author,
+                       asserted_at=now, asserted_commit=commit,
+                       meta={"binding": BINDING_MARK,
+                             "why": args.why.strip()})
+            if not exists:
+                made += 1
+        if ambiguous:
+            print(f"note: '{node['name']}' matched multiple code nodes; "
+                  f"bound [{node['id']}] (first id-sorted hit)")
+    save_graph(paths, graph)
+    print(f"Bound {len(code_nodes)} code node(s) to "
+          f"{G.ASSERTED_MARKER} {req_node['id']} (realizes) + "
+          f"{G.ASSERTED_MARKER} {slice_node['id']} (delivered-in)"
+          + (f" + {G.ASSERTED_MARKER} {dec_node['id']} (motivated-by)"
+             if dec_node is not None else "")
+          + f": {made} new binding edge(s), author '{author}', "
+          f"commit {(commit or '?')[:12]}. Why: {args.why.strip()}")
+    return 0
+
+
+def _mark_bindings_review(graph, intent_edges, relevant, commit):
+    """Mark bindings needs-review when a bound code node changed/deleted.
+
+    `relevant` = rescanned-or-deleted scanned files this sync. A binding
+    edge whose code endpoint (a) no longer exists in the graph (deleted) or
+    (b) was file-attributed to a rescanned path (materially changed) gets
+    meta.review = 'needs-review' + meta.review_reason, and the intent node
+    it points at gets status needs-review. Reason recorded; counts
+    returned for the sync summary. Pure graph mutation (no I/O)."""
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    marked = 0
+    for e in intent_edges:
+        if e.get("meta", {}).get("binding") != BINDING_MARK:
+            continue
+        code_end = None
+        intent_end = None
+        for end in (e["src"], e["dst"]):
+            n = by_id.get(end)
+            if n is not None and G.is_asserted(n):
+                intent_end = n
+            else:
+                code_end = end
+        if code_end is None or intent_end is None:
+            continue
+        code_node = by_id.get(code_end)
+        if code_node is None:
+            reason = (f"bound code node '{code_end}' no longer exists "
+                      f"(deleted or renamed)")
+        elif code_node.get("file") in (relevant or set()):
+            reason = (f"bound code node '{code_end}' changed "
+                      f"(`{code_node.get('file')}` rescanned)")
+        else:
+            continue
+        meta = e.setdefault("meta", {})
+        if meta.get("review") != "needs-review" \
+                or meta.get("review_reason") != reason:
+            meta["review"] = "needs-review"
+            meta["review_reason"] = reason
+            meta["review_commit"] = commit
+            marked += 1
+        if intent_end.get("status") != "needs-review":
+            intent_end["status"] = "needs-review"
+            intent_end.setdefault("meta", {})["review_reason"] = reason
+    return marked
+
+
+def cmd_why(args):
+    """`why <node>` — reverse lookup: file/symbol/endpoint -> intent.
+
+    Human-first output: plain-language claim first, then evidence, then
+    node IDs. Every intent line carries the [ASSERTED] marker."""
+    root = os.path.abspath(args.root)
+    paths = map_paths(root, args.map_dir)
+    if not os.path.exists(paths["graph"]):
+        print("STATUS: NO_MAP — run `init` first.")
+        return 1
+    try:
+        graph, _ = load_graph_migrated(paths)
+    except (OSError, ValueError) as exc:
+        print(f"STATUS: CORRUPT — graph.json unreadable ({exc}); "
+              "run `init --full` to rebuild.")
+        return 2
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    hits = find_nodes(graph, args.node)
+    if args.node in by_id:
+        hits = [by_id[args.node]]
+    if not hits:
+        print(f"No nodes match '{args.node}'.")
+        return 1
+    # code node under the query: file substring also matches ("Claim.java"
+    # finds every symbol evidenced at that file).
+    targets = list(hits)
+    for n in graph["nodes"]:
+        if G.is_asserted(n):
+            continue
+        if args.node in (n.get("file") or "") and n not in targets:
+            targets.append(n)
+    targets = targets[:8]
+    # intent edges touching any target (binding endpoint on either side).
+    target_ids = {t["id"] for t in targets}
+    bindings = [e for e in graph["edges"]
+                if G.is_asserted(e)
+                and (e["src"] in target_ids or e["dst"] in target_ids)]
+    if not bindings:
+        print(f"WHY: '{args.node}' has no intent bindings — no requirement "
+              f"claims this code yet (bind one with `intent bind`).")
+        return 1
+    by_kind_edge = {}
+    for e in bindings:
+        other = e["dst"] if e["src"] in target_ids else e["src"]
+        by_kind_edge.setdefault(e["type"], []).append((e, other))
+    print(f"WHY: '{args.node}' — "
+          f"{len(bindings)} intent binding(s) claim this code:")
+    for etype in ("realizes", "delivered-in", "motivated-by", "denotes",
+                  "part-of"):
+        for e, oid in sorted(by_kind_edge.get(etype, []),
+                             key=lambda x: x[1]):
+            n = by_id.get(oid, {})
+            claim = (n.get("title") or n.get("name", oid))
+            why = e.get("meta", {}).get("why", "")
+            review = e.get("meta", {}).get("review", "")
+            if etype == "realizes":
+                print(f"- This code exists to satisfy: \"{claim}\" "
+                      f"{G.ASSERTED_MARKER}")
+            elif etype == "delivered-in":
+                print(f"- This code shipped in: \"{claim}\" "
+                      f"{G.ASSERTED_MARKER}")
+            elif etype == "motivated-by":
+                print(f"- This code is shaped by decision: \"{claim}\" "
+                      f"{G.ASSERTED_MARKER}")
+            elif etype == "denotes":
+                print(f"- This symbol means (domain concept): \"{claim}\" "
+                      f"{G.ASSERTED_MARKER}")
+            else:
+                print(f"- Related ({etype}): \"{claim}\" "
+                      f"{G.ASSERTED_MARKER}")
+            if why:
+                print(f"  Because: {why}")
+            ev = [t for t in targets
+                  if t["id"] in (e["src"], e["dst"])]
+            for t in ev[:3]:
+                loc = f"`{t.get('file')}`" + (
+                    f":{t.get('line')}" if t.get("line") else "")
+                print(f"  Evidence: {t['kind']} `{t['name']}` at {loc} "
+                      f"(DERIVED, {t.get('confidence')})")
+            if review == "needs-review":
+                print(f"  !! NEEDS-REVIEW: "
+                      f"{e.get('meta', {}).get('review_reason', '')}")
+            print(f"  Intent: [{oid}] source "
+                  f"{n.get('source', '?')} by {n.get('author', '?')}")
+    return 0
+
+
+def cmd_responsible_for(args):
+    """`responsible-for <intent-id>` — forward lookup: intent -> code.
+
+    Requirement/capability -> realizing code nodes + covering tests.
+    Human-first: plain-language claim first, then code, then IDs."""
+    root = os.path.abspath(args.root)
+    paths = map_paths(root, args.map_dir)
+    if not os.path.exists(paths["graph"]):
+        print("STATUS: NO_MAP — run `init` first.")
+        return 1
+    try:
+        graph, _ = load_graph_migrated(paths)
+    except (OSError, ValueError) as exc:
+        print(f"STATUS: CORRUPT — graph.json unreadable ({exc}); "
+              "run `init --full` to rebuild.")
+        return 2
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    node = by_id.get(args.intent_id)
+    if node is None:
+        hits = [n for n in find_nodes(graph, args.intent_id)
+                if G.is_asserted(n)]
+        if len(hits) == 1:
+            node = hits[0]
+        elif not hits:
+            print(f"No intent node matches '{args.intent_id}' "
+                  f"(run `intent import` first).")
+            return 1
+        else:
+            print(f"Ambiguous '{args.intent_id}': matches "
+                  f"{len(hits)} intent nodes; pass an exact intent id:")
+            for h in hits[:8]:
+                print(f"  [{h['id']}] {h.get('title', h['name'])} "
+                      f"{G.ASSERTED_MARKER}")
+            return 1
+    if not G.is_asserted(node):
+        print(f"[{node['id']}] is a DERIVED code node, not intent; "
+              f"`responsible-for` needs an intent id "
+              f"(run `intent import` first).")
+        return 1
+    iid = node["id"]
+    claim = node.get("title") or node["name"]
+    print(f"RESPONSIBLE-FOR: \"{claim}\" {G.ASSERTED_MARKER} [{iid}]")
+    print(f"Claim: {claim} (status: {node.get('status', 'active')}, "
+          f"source {node.get('source', '?')} by {node.get('author', '?')})")
+    # realizing code: incoming realizes edges + member requirements'
+    # realizes (capability -> its part-of requirements -> their code).
+    code_ids = set()
+    why_by_code = {}
+    for e in graph["edges"]:
+        if e["type"] == "realizes" and e["dst"] == iid \
+                and e["dst"] in by_id:
+            code_ids.add(e["src"])
+            why_by_code[e["src"]] = e.get("meta", {}).get("why", "")
+    if node["kind"] == "capability":
+        member_reqs = [e["src"] for e in graph["edges"]
+                       if e["type"] == "part-of" and e["dst"] == iid]
+        for e in graph["edges"]:
+            if e["type"] == "realizes" and e["dst"] in member_reqs:
+                code_ids.add(e["src"])
+                why_by_code.setdefault(
+                    e["src"], e.get("meta", {}).get("why", ""))
+    # slices delivering this intent (delivered-in edges pointing here, or
+    # slices part-of this capability).
+    slice_ids = {e["src"] for e in graph["edges"]
+                 if e["type"] == "delivered-in" and e["dst"] == iid}
+    slice_ids |= {e["src"] for e in graph["edges"]
+                  if e["type"] == "part-of" and e["dst"] == iid
+                  and by_id.get(e["src"], {}).get("kind") == "slice"}
+    if slice_ids:
+        print("Delivered in:")
+        for sid in sorted(slice_ids):
+            s = by_id.get(sid, {})
+            print(f"  - \"{s.get('title', s.get('name', sid))}\" "
+                  f"{G.ASSERTED_MARKER} [{sid}]")
+    if not code_ids:
+        print("Realizing code: (none bound yet — no `intent bind` edges "
+              "point here)")
+        return 1
+    # covering tests: `tests` edges incident on the realizing code nodes.
+    test_ids = set()
+    for e in graph["edges"]:
+        if e["type"] == "tests" and (
+                e["src"] in code_ids or e["dst"] in code_ids):
+            test_ids.add(e["dst"] if e["src"] in code_ids else e["src"])
+    print(f"Realizing code ({len(code_ids)} node(s)):")
+    for cid in sorted(code_ids):
+        c = by_id.get(cid, {})
+        loc = f"`{c.get('file', '?')}`" + (
+            f":{c.get('line')}" if c.get("line") else "")
+        flag = ""
+        for e in graph["edges"]:
+            if e.get("meta", {}).get("review") == "needs-review" and (
+                    e["src"] == cid or e["dst"] == cid):
+                flag = (f"  !! NEEDS-REVIEW: "
+                        f"{e['meta'].get('review_reason', '')}")
+                break
+        print(f"  - {c.get('kind', '?')} `{c.get('name', cid)}` at {loc} "
+              f"(DERIVED, {c.get('confidence', '?')})")
+        if why_by_code.get(cid):
+            print(f"    Why bound: {why_by_code[cid]}")
+        if flag:
+            print(flag)
+        print(f"    [{cid}]")
+    if test_ids:
+        print(f"Covering tests ({len(test_ids)}):")
+        for tid in sorted(test_ids):
+            t = by_id.get(tid, {})
+            print(f"  - `{t.get('name', tid)}` "
+                  f"`{t.get('file', '?')}` [{tid}]")
+    else:
+        print("Covering tests: (none recorded — no `tests` edges touch "
+              "these code nodes yet)")
+    return 0
+
+
+def cmd_intent(args):
+    if args.intent_cmd == "import":
+        return cmd_intent_import(args)
+    if args.intent_cmd == "bind":
+        return cmd_intent_bind(args)
+    print(f"Unknown intent subcommand: {args.intent_cmd}")
+    return 2
 
 
 def cmd_status(args):
@@ -1343,6 +2260,48 @@ def cmd_validate(args):
     print(f"Deleted files referenced: {len(missing_files)}")
     for f in sorted(missing_files)[:10]:
         print(f"  DEL {f}")
+    # Intent-layer checks (Wave 4a): bindings pointing at nonexistent code
+    # nodes (dangling), and requirements/capabilities with zero bindings.
+    # Reported as NEEDS_ATTENTION findings (same severity as other hygiene
+    # issues); full drift/violates coverage is deferred to a later wave.
+    # Intent doc sources (docs/*.md) are curated, not scanned: they must
+    # not trip the missing-files check above.
+    for n in graph["nodes"]:
+        if G.is_asserted(n) and n.get("file") in missing_files:
+            missing_files.discard(n["file"])
+    dangling = sorted({
+        (e["src"] if e["dst"] in ids and G.is_asserted(
+            next(n for n in graph["nodes"] if n["id"] == e["dst"]))
+         else e["dst"])
+        for e in graph["edges"]
+        if G.is_asserted(e) and (
+            e["src"] not in ids or e["dst"] not in ids)
+    })
+    bound_targets = {e["dst"] for e in graph["edges"]
+                     if G.is_asserted(e) and e["type"] == "realizes"
+                     and e["dst"] in ids}
+    member_of = {}
+    for e in graph["edges"]:
+        if e["type"] == "part-of" and e["dst"] in ids:
+            member_of.setdefault(e["dst"], set()).add(e["src"])
+    unbound = sorted(
+        n["id"] for n in graph["nodes"]
+        if G.is_asserted(n)
+        and n["kind"] in ("requirement", "capability")
+        and n["id"] not in bound_targets
+        and not (member_of.get(n["id"], set()) & bound_targets))
+    needs_review = sorted(
+        n["id"] for n in graph["nodes"]
+        if G.is_asserted(n) and n.get("status") == "needs-review")
+    print(f"Intent dangling refs: {len(dangling)}")
+    for d in dangling[:10]:
+        print(f"  DANGLING {md_cell(d)[:80]}")
+    print(f"Requirements without bindings: {len(unbound)}")
+    for u in unbound[:10]:
+        print(f"  UNBOUND {md_cell(u)[:80]}")
+    print(f"Intent needs-review: {len(needs_review)}")
+    for r in needs_review[:10]:
+        print(f"  REVIEW {md_cell(r)[:80]}")
     # Verdict shares freshness_verdict() with status: NEEDS_SYNC iff any
     # content-stale file (same hash check), so the two never disagree.
     verdict = verdict_pre
@@ -1351,7 +2310,8 @@ def cmd_validate(args):
     for f in sorted(stale_files)[:10]:
         print(f"  STALE {f}")
     bad = broken or dupes or missing_files or no_evidence or bad_kinds \
-        or bad_edges or bad_id_nodes or bad_id_edges
+        or bad_edges or bad_id_nodes or bad_id_edges \
+        or dangling or unbound or needs_review
     # "Status:" is the integrity verdict (map hygiene); "Freshness verdict:"
     # is the staleness verdict shared with status (hash check). They answer
     # different questions on purpose: a freshly-synced map can still carry
@@ -1735,6 +2695,40 @@ def main(argv=None):
     p_flow.set_defaults(fn=cmd_flow)
     p_det = sub.add_parser("detect", help="show detected stack")
     p_det.set_defaults(fn=cmd_detect)
+    p_int = sub.add_parser("intent", help="intent layer (asserted claims)")
+    p_int_sub = p_int.add_subparsers(dest="intent_cmd", required=True)
+    p_imp = p_int_sub.add_parser("import", help="parse docs/*.md into "
+                                 "intent nodes (idempotent)")
+    p_imp.set_defaults(fn=cmd_intent)
+    p_bind = p_int_sub.add_parser("bind", help="attach code nodes to "
+                                  "intent nodes")
+    p_bind.add_argument("--slice", required=True,
+                        help="intent slice/requirement/capability id or name")
+    p_bind.add_argument("--realizes", required=True,
+                        help="intent requirement/capability id or name")
+    p_bind.add_argument("--nodes", required=True, nargs="+",
+                        action="append",
+                        help="code node ids or names (space-separated; "
+                        "comma-separated also accepted; repeatable)")
+    p_bind.add_argument("--why", required=True,
+                        help="plain-language reason for the binding")
+    p_bind.add_argument("--author", default=None,
+                        help="binding author (default: agent)")
+    p_bind.add_argument("--decision", default=None,
+                        help="intent decision id (adds motivated-by edges)")
+    p_bind.add_argument("--declares-files", dest="declares_files",
+                        nargs="*", default=None,
+                        help="pre-implementation file declaration "
+                        "(workflow slice step 1: stored verbatim for "
+                        "later drift comparison)")
+    p_bind.set_defaults(fn=cmd_intent)
+    p_why = sub.add_parser("why", help="reverse lookup: code -> intent")
+    p_why.add_argument("node", help="symbol, endpoint, file or node id")
+    p_why.set_defaults(fn=cmd_why)
+    p_resp = sub.add_parser("responsible-for", help="forward lookup: "
+                            "intent -> realizing code + tests")
+    p_resp.add_argument("intent_id", help="intent node id or name")
+    p_resp.set_defaults(fn=cmd_responsible_for)
     p_viz = sub.add_parser("visualize",
                            help="generate interactive HTML visualization")
     p_viz.add_argument("--kind", default="architecture",

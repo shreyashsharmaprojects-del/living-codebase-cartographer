@@ -35,17 +35,26 @@ itself is closed and technology-independent.
 
 ## Install
 
-Clone the repo, then copy it into your project as a skill:
+Copy this directory into your project as
+`.dsh/skills/living-codebase-cartographer/`, or clone the published repo.
+There is nothing to install — the scanner is stdlib-only.
+
+Release archives are produced only by `scripts/package.sh` (the single
+packaging path — it excludes regenerable bytecode and stamps a
+`RELEASE.json` build marker; an archive without that marker was not built
+by packaging):
 
 ```bash
-git clone https://github.com/shreyashsharmaprojects-del/living-codebase-cartographer.git
-rsync -a --exclude __pycache__ --exclude '*.pyc' \
-  living-codebase-cartographer/ <your-project>/.dsh/skills/living-codebase-cartographer/
-# (or <your-project>/.claude/skills/ — the scanner excludes its own
-# install dir at runtime, so location does not matter)
+sh scripts/package.sh /tmp/living-codebase-cartographer.tar.gz
 ```
 
-There is nothing to install — the scanner is stdlib-only.
+When copying by hand instead, exclude `__pycache__/` and `*.pyc`
+(regenerated on first run; listed in `.gitignore`):
+
+```bash
+rsync -a --exclude __pycache__ --exclude '*.pyc' \
+  living-codebase-cartographer/ <dest>/.dsh/skills/living-codebase-cartographer/
+```
 
 ## Quick start
 
@@ -101,8 +110,8 @@ living-codebase-cartographer/
 Run the suites before publishing or after any analyzer change:
 
 ```bash
-python3 tests/run_tests.py        # 166 checks
-python3 tests/run_viz_tests.py    # 81 checks
+python3 tests/run_tests.py        # 258 checks
+python3 tests/run_viz_tests.py    # 130 checks
 ```
 
 ## Design rules
@@ -144,9 +153,9 @@ over `file://`. Air-gapped environments welcome.
 
 **A dependency-graph / call-graph visualizer?**
 Yes — nine graph modes (architecture, dependency, call-graph, data-flow, api,
-database, external, impact, flow) plus eight structured views (Overview,
-Endpoints, Data, Dependencies, Symbols, Flows, Graph, Issues), with
-left-to-right layered layout, confidence-encoded edges, and editor deep-links.
+database, external, impact, flow) plus nine structured views (Overview,
+Endpoints, Data, Dependencies, Symbols, Flows, Capabilities, Graph, Issues),
+with left-to-right layered layout, confidence-encoded edges, and editor deep-links.
 
 **An impact-analysis / blast-radius tool?**
 Yes — `impact <Symbol>` computes reverse-reachability (callers, consumers,

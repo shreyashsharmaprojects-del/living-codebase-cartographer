@@ -53,13 +53,13 @@ def _sid(text):
 
 
 MANIFEST_DEP_RES = [
-    (re.compile(r"<artifactId>([^<]+)</artifactId>"), "maven"),
-    (re.compile(r'"([^"]+)"\s*:\s*"[^"]*"\s*[,}]'), "npm"),
+    (re.compile(r"<artifactId>([^<]+)</artifactId>"), "maven", "MEDIUM"),
+    (re.compile(r'"([^"]+)"\s*:\s*"[^"]*"\s*[,}]'), "npm", "MEDIUM"),
     # [ \t] not \s after ^: \s would swallow newlines under re.M and
     # attribute the match to the blank lines above instead of its own line.
-    (re.compile(r"^[ \t]*([\w./-]+)[ \t]+v?[\d.]+", re.M), "go"),
-    (re.compile(r"^[ \t]*([\w-]+)[ \t]*=[ \t]*\"[^\"]*\"", re.M), "cargo"),
-    (re.compile(r"^[ \t]*([\w_.-]+)[ \t]*(?:==|>=|~=|>|<)[^,\s]*", re.M), "pip"),
+    (re.compile(r"^[ \t]*([\w./-]+)[ \t]+v?[\d.]+", re.M), "go", "LOW"),
+    (re.compile(r"^[ \t]*([\w-]+)[ \t]*=[ \t]*\"[^\"]*\"", re.M), "cargo", "LOW"),
+    (re.compile(r"^[ \t]*([\w_.-]+)[ \t]*(?:==|>=|~=|>|<)[^,\s]*", re.M), "pip", "LOW"),
 ]
 
 
@@ -131,8 +131,12 @@ def scan(ctx, path, text):
                            {"kind": "compose"})
         # Only the `services:` block declares services; sibling top-level
         # blocks (volumes/networks/configs/secrets) never do.
+        # [ \t] (not \s) for gaps around ':' and [^:\n] (not [^:]) for
+        # the key: both would otherwise span line breaks under re.M — a
+        # bare word line above a header (e.g. `foo` over `services:`)
+        # would swallow the header and flip in_services wrongly.
         in_services = False
-        for m in re.finditer(r"^( *)([^:\s][^:]*):[ \t]*(?:\r?\n|$)",
+        for m in re.finditer(r"^( *)([^:\s][^:\n]*?):[ \t]*(?:\r?\n|$)",
                              text, re.M):
             indent = len(m.group(1))
             key = m.group(2).strip().strip("\"'")
@@ -283,7 +287,7 @@ def scan(ctx, path, text):
         return
 
     # --- build manifests: dependency edges (generic depends-on) ---
-    for rx, via in MANIFEST_DEP_RES:
+    for rx, via, dep_conf in MANIFEST_DEP_RES:
         if base in ("pom.xml",) and via != "maven":
             continue
         hits = rx.findall(text)
@@ -299,5 +303,5 @@ def scan(ctx, path, text):
                          _sid(f"unresolved:module:{via}:{dep}"),
                          "depends-on",
                          text[:line].count("\n") + 1 if line >= 0 else 1,
-                         "LOW", {"via": via})
+                         dep_conf, {"via": via})
             return

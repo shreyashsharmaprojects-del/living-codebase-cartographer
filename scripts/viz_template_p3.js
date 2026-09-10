@@ -70,6 +70,11 @@ function hitEdge(px,py){
   return best;
 }
 function pick(px,py,ev){
+  const hc=hitContainer(px,py);
+  if(hc){  // fold the module: members leave the layout (never a fade)
+    S.folded[hc.g]=true; S.sel=null;
+    pushHist(); rebuild(); syncURL(); return;
+  }
   const h=hit(px,py);
   if(h){
     if(h.kind==="__group__"){ S.group=h.id; S.sel=null; pushHist(); rebuild(); syncURL(); return; }
@@ -188,15 +193,36 @@ document.addEventListener("keydown",e=>{
   else if(e.key==="-"||e.key==="_"){zoom(1/1.2);}
   else if(e.key==="["){histGo(-1);}
   else if(e.key==="]"){histGo(1);}
-  else if(e.key==="ArrowRight"&&S.view==="graph"){stepSel(1);}
-  else if(e.key==="ArrowLeft"&&S.view==="graph"){stepSel(-1);}
+  else if(e.key==="Enter"&&S.view==="graph"&&S.sel){e.preventDefault();select(S.sel,false);}
+  else if(e.key==="ArrowRight"&&S.view==="graph"){e.preventDefault();stepSel(1);}
+  else if(e.key==="ArrowLeft"&&S.view==="graph"){e.preventDefault();stepSel(-1);}
+  else if(e.key==="ArrowUp"&&S.view==="graph"){e.preventDefault();stepSel(-1);}
+  else if(e.key==="ArrowDown"&&S.view==="graph"){e.preventDefault();stepSel(1);}
 });
 function stepSel(d){
+  // arrows move between NEIGHBOURS of the selection (brief 4.5); with no
+  // selection they walk the laid-out nodes in deterministic id order.
   if(!S.nodes.length) return;
-  const ids = S.nodes.map(n=>n.id).sort();
+  let ids;
+  if(S.sel && S.byId[S.sel]){
+    const nb = new Set();
+    (S.adj[S.sel]||[]).forEach(t=>{if(S.byId[t])nb.add(t);});
+    (S.inadj[S.sel]||[]).forEach(t=>{if(S.byId[t])nb.add(t);});
+    ids = [...nb].sort();
+    if(!ids.length) ids = S.nodes.map(n=>n.id).sort();
+  } else ids = S.nodes.map(n=>n.id).sort();
   let i = S.sel ? ids.indexOf(S.sel) : (d>0?-1:0);
   i = (i+d+ids.length)%ids.length;
   select(ids[i], true);
+}
+function hitContainer(px,py){
+  // container header strip (top ~18px of each drawn boundary box)
+  const cs = S._containers||[];
+  for(let i=cs.length-1;i>=0;i--){
+    const c=cs[i];
+    if(px>=c.sx&&px<=c.sx+c.w&&py>=c.sy&&py<=c.sy+20) return c;
+  }
+  return null;
 }
 
 /* ---------- search ---------- */
@@ -336,8 +362,17 @@ function flowSummary(){
 function renderBanner(){
   const b=$("banner");
   if(S.view!=="graph"){ b.classList.remove("show"); return; }
+  const folds=Object.keys(S.folded);
+  if(folds.length && !S.truncated){
+    b.innerHTML="Folded: <b>"+esc(folds.slice(0,5).join(", "))+"</b>"+(folds.length>5?" +"+(folds.length-5)+" more":"")+" (members out of layout). "+
+      "<button class='btn' id='capclear'>Unfold all</button>";
+    b.classList.add("show");
+    const c=$("capclear");
+    if(c) c.onclick=()=>{S.folded={};rebuild();};
+    return;
+  }
   if(S.truncated){
-    b.innerHTML="Showing <b>"+S.truncated.shown+" of "+S.truncated.total+"</b> nodes — filter on the left or drill into a group for detail. "+
+    b.innerHTML="Showing <b>"+S.truncated.shown+" of "+S.truncated.total+"</b> nodes — filter or drill into a module to see more. "+
       "<button class='btn' id='capclear'>Clear filters</button>";
     b.classList.add("show");
     const c=$("capclear");
@@ -415,7 +450,7 @@ function renderViews(){
   const defs = [
     ["overview","Overview"],["endpoints","Endpoints"],["data","Data"],
     ["dependencies","Dependencies"],["symbols","Symbols"],["flows","Flows"],
-    ["graph","Graph"],["issues","Issues"],
+    ["capabilities","Capabilities"],["graph","Graph"],["issues","Issues"],
   ];
   const m=$("views"); m.innerHTML="";
   defs.forEach(([k,label])=>{
@@ -425,6 +460,7 @@ function renderViews(){
     else if(k==="dependencies") n=(T.dependencies||[]).length;
     else if(k==="symbols") n=(T.symbols||{}).total;
     else if(k==="flows") n=(T.flows||[]).length;
+    else if(k==="capabilities") n=(T.capabilities||[]).length;
     else if(k==="issues") n=(T.issues||[]).length;
     b.textContent = label+(n!=null?" ("+n+")":"");
     if(k===S.view) b.className="on";
@@ -517,6 +553,7 @@ function renderTable(){
   if(V==="dependencies") return renderDeps(el,T);
   if(V==="symbols") return renderSymbols(el,T);
   if(V==="flows") return renderFlows(el,T);
+  if(V==="capabilities") return renderCapabilities(el,T);
   if(V==="issues") return renderIssues(el,T);
   el.innerHTML=errState("Unknown view: "+V);
 }
@@ -552,19 +589,19 @@ function renderOverview(el,T){
 }
 function renderEndpoints(el,T){
   const rows=(T.endpoints||[]).slice().sort((a,b)=>(a.path||"")<(b.path||"")?-1:1);
-  let h="<h1>Endpoints</h1><p class='lede'>method / path / handler / source / confidence / consumers.</p>";
+  let h="<h1>Endpoints</h1><p class='lede'>method / path / handler / source / confidence / consumers / downstream reach. Every row links to the inspector and file:line.</p>";
   h+="<div class='toolbar'><input type='text' id='tf' placeholder='Filter endpoints…' value='"+esc(S.tfilter)+"'></div>";
   const hay=r=>(r.method+" "+r.path+" "+(r.handler||"")+" "+(r.file||""));
   const got=filteredRows(rows,hay);
-  const get=(r,c)=>c==="consumers"?r.n_consumers:r[c];
+  const get=(r,c)=>c==="consumers"?r.n_consumers:(c==="reach"?(r.reach||0):r[c]);
   const s=sortRows(got,S.tsort&&S.tsort.col,S.tsort&&S.tsort.dir,get);
-  const ds={ep:copyOut(0,got,["method","path","handler","file","line","conf"])};
-  h+=copyBar("ep",got,["method","path","handler","file","line","conf"]);
+  const ds={ep:copyOut(0,got,["method","path","handler","file","line","conf","n_consumers","reach"])};
+  h+=copyBar("ep",got,["method","path","handler","file","line","conf","n_consumers","reach"]);
   if(!s.length) h+=emptyState("endpoints");
   else{
-    h+="<table class='tv'><tr>"+th("method","Method",S.tsort)+th("path","Path",S.tsort)+th("handler","Handler",S.tsort)+th("file","Source",S.tsort)+th("conf","Conf",S.tsort)+th("n_consumers","Consumers",S.tsort)+"</tr>";
+    h+="<table class='tv'><tr>"+th("method","Method",S.tsort)+th("path","Path",S.tsort)+th("handler","Handler",S.tsort)+th("file","Source",S.tsort)+th("conf","Conf",S.tsort)+th("n_consumers","Consumers",S.tsort)+th("reach","Downstream",S.tsort)+"</tr>";
     s.slice(0,500).forEach(r=>{
-      h+="<tr><td class='mono'>"+esc(r.method||"—")+"</td><td>"+rowLink(r.id,(r.method?r.method+" ":"")+r.path)+"</td><td class='mono'>"+(r.handler?rowLink(r.handler,r.handler):"<span style='color:var(--faint)'>—</span>")+"</td><td class='mono'>"+srcLink(r.file,r.line)+"</td><td><span class='pill "+esc(r.conf)+"'>"+esc(r.conf)+"</span></td><td class='mono'>"+r.n_consumers+"</td></tr>";
+      h+="<tr><td class='mono'>"+esc(r.method||"—")+"</td><td>"+rowLink(r.id,(r.method?r.method+" ":"")+r.path)+"</td><td class='mono'>"+(r.handler?rowLink(r.handler,r.handler):"<span style='color:var(--faint)'>—</span>")+"</td><td class='mono'>"+srcLink(r.file,r.line)+"</td><td><span class='pill "+esc(r.conf)+"'>"+esc(r.conf)+"</span></td><td class='mono'>"+r.n_consumers+"</td><td class='mono'>"+(r.reach||0)+"</td></tr>";
     });
     h+="</table>"+(s.length>500?"<div class='empty'>Showing 500 of "+s.length+" — refine the filter.</div>":"");
   }
@@ -573,40 +610,58 @@ function renderEndpoints(el,T){
   $("tf").oninput=e=>{S.tfilter=e.target.value;renderEndpoints(el,T);const f=$("tf");f.focus();f.setSelectionRange(f.value.length,f.value.length);};
 }
 function renderData(el,T){
-  const d=T.data||{tables:[],access:[]};
-  let h="<h1>Data</h1><p class='lede'>Stores plus every evidenced read/write access.</p>";
+  const d=T.data||{tables:[],access:[],migrations:[]};
+  let h="<h1>Data</h1><p class='lede'>Stores plus every evidenced read/write access, plus the migrations that define each store.</p>";
   h+="<div class='toolbar'><input type='text' id='tf' placeholder='Filter tables / actors…' value='"+esc(S.tfilter)+"'></div>";
-  const t=filteredRows(d.tables,r=>r.label+" "+r.kind+" "+(r.file||""));
+  const t=filteredRows(d.tables,r=>r.label+" "+r.kind+" "+(r.file||"")+((r.columns||[]).join(" ")));
   const ds={dt:copyOut(0,d.tables,["label","kind","file","line","conf"])};
   h+="<h2>Tables &amp; stores ("+t.length+")</h2>"+copyBar("dt",t,["label","kind","file","line","conf"]);
-  h+= t.length? "<table class='tv'><tr><th>store</th><th>kind</th><th>source</th><th>conf</th><th>degree</th></tr>"+
-    t.slice(0,300).map(r=>"<tr><td>"+rowLink(r.id,r.label)+"</td><td class='mono'>"+esc(r.kind)+"</td><td class='mono'>"+srcLink(r.file,r.line)+"</td><td><span class='pill "+esc(r.conf)+"'>"+esc(r.conf)+"</span></td><td class='mono'>"+r.deg+"</td></tr>").join("")+"</table>"
+  h+= t.length? "<table class='tv'><tr>"+th("label","Store",S.tsort)+th("kind","Kind",S.tsort)+th("columns","Columns",S.tsort)+th("file","Source",S.tsort)+th("conf","Conf",S.tsort)+th("deg","Degree",S.tsort)+"</tr>"+
+    t.slice(0,300).map(r=>"<tr><td>"+rowLink(r.id,r.label)+"</td><td class='mono'>"+esc(r.kind)+"</td><td class='mono' style='color:var(--faint)'>"+((r.columns&&r.columns.length)?esc(r.columns.join(", ")):"not in graph — see migration DDL")+"</td><td class='mono'>"+srcLink(r.file,r.line)+"</td><td><span class='pill "+esc(r.conf)+"'>"+esc(r.conf)+"</span></td><td class='mono'>"+r.deg+"</td></tr>").join("")+"</table>"
     : emptyState("stores");
   const a=filteredRows(d.access,r=>r.table+" "+r.op+" "+r.actor+" "+(r.file||""));
   h+="<h2>Readers &amp; writers ("+a.length+")</h2>";
   h+= a.length? "<table class='tv'><tr><th>store</th><th>op</th><th>actor</th><th>source</th><th>conf</th></tr>"+
     a.slice(0,500).map(r=>"<tr><td>"+rowLink(r.table,r.table)+"</td><td class='mono'>"+esc(r.op)+"</td><td>"+rowLink(r.actor,r.actor)+"</td><td class='mono'>"+srcLink(r.file,r.line)+"</td><td><span class='pill "+esc(r.conf)+"'>"+esc(r.conf)+"</span></td></tr>").join("")+"</table>"
     : emptyState("access rows");
+  const migs=filteredRows(d.migrations||[],r=>r.table+" "+r.migration+" "+(r.file||""));
+  h+="<h2>Migrations ("+migs.length+")</h2>";
+  h+= migs.length? "<table class='tv'><tr><th>store</th><th>migration</th><th>source</th><th>conf</th></tr>"+
+    migs.slice(0,300).map(r=>"<tr><td>"+rowLink(r.table,r.table)+"</td><td>"+rowLink(r.migration_id,r.migration)+"</td><td class='mono'>"+srcLink(r.file,r.line)+"</td><td><span class='pill "+esc(r.conf)+"'>"+esc(r.conf)+"</span></td></tr>").join("")+"</table>"
+    : "<div class='empty'>No migration→store links evidenced in the graph.</div>";
   el.innerHTML=h; bindLinks(el); bindCopy(el,ds);
+  bindSort(el,(r,c)=>r[c],()=>renderData(el,T));
   $("tf").oninput=e=>{S.tfilter=e.target.value;renderData(el,T);const f=$("tf");f.focus();f.setSelectionRange(f.value.length,f.value.length);};
 }
 function renderDeps(el,T){
   const rows=(T.dependencies||[]).slice();
-  let h="<h1>Dependencies</h1><p class='lede'>External services grouped by manifest file.</p>";
+  let h="<h1>Dependencies</h1><p class='lede'>External modules grouped by manifest — version, importing files, source. (Versions come from graph evidence only; blank means unrecorded, not latest.)</p>";
   h+="<div class='toolbar'><input type='text' id='tf' placeholder='Filter dependencies…' value='"+esc(S.tfilter)+"'></div>";
-  const hay=r=>r.label+" "+r.manifest+" "+(r.file||"");
+  const hay=r=>r.label+" "+r.manifest+" "+(r.version||"")+" "+((r.importing||[]).join(" "))+" "+(r.file||"");
   const got=filteredRows(rows,hay);
-  const ds={dp:copyOut(0,got,["label","manifest","conf"])};
-  h+=copyBar("dp",got,["label","manifest","conf"]);
-  if(!got.length) h+=emptyState("dependencies");
+  const get=(r,c)=>c==="importing"?(r.n_importing||0):r[c];
+  const s=sortRows(got,S.depSort&&S.depSort.col,S.depSort&&S.depSort.dir,get);
+  const ds={dp:copyOut(0,got,["label","manifest","version","conf"])};
+  h+=copyBar("dp",got,["label","manifest","version","conf"]);
+  if(!s.length) h+=emptyState("dependencies");
   else{
-    let last=null;
-    got.forEach(r=>{
-      if(r.manifest!==last){ last=r.manifest; h+="<div class='manifest'>"+esc(last||"(no manifest)")+"</div>"; }
-      h+="<div class='step'><span style='min-width:220px'>"+rowLink(r.id,r.label)+"</span> <span class='pill "+esc(r.conf)+"'>"+esc(r.conf)+"</span> <span class='mono' style='font-size:12px;color:var(--faint)'>"+srcLink(r.file,r.line)+"</span></div>";
+    h+="<table class='tv'><tr>"+th("label","Module",S.depSort)+th("manifest","Manifest",S.depSort)+th("version","Version",S.depSort)+th("n_importing","Importers",S.depSort)+th("conf","Conf",S.depSort)+th("file","Source",S.depSort)+"</tr>";
+    let lastManifest=null;
+    s.slice(0,500).forEach(r=>{
+      if(r.manifest!==lastManifest){ lastManifest=r.manifest; h+="<tr><td colspan='6' class='manifest'>"+esc(lastManifest||"(no manifest)")+"</td></tr>"; }
+      h+="<tr><td>"+rowLink(r.id,r.label)+"</td><td class='mono'>"+esc(r.manifest||"—")+"</td><td class='mono'>"+(r.version?esc(r.version):"<span style='color:var(--faint)'>unrecorded</span>")+"</td><td class='mono' title='"+esc((r.importing||[]).join(", "))+"'>"+(r.n_importing||0)+"</td><td><span class='pill "+esc(r.conf)+"'>"+esc(r.conf)+"</span></td><td class='mono'>"+srcLink(r.file,r.line)+"</td></tr>";
     });
+    h+="</table>"+(s.length>500?"<div class='empty'>Showing 500 of "+s.length+" — refine the filter.</div>":"");
   }
   el.innerHTML=h; bindLinks(el); bindCopy(el,ds);
+  el.querySelectorAll("th[data-c]").forEach(hh=>{
+    hh.onclick=()=>{
+      const c=hh.getAttribute("data-c");
+      if(S.depSort&&S.depSort.col===c) S.depSort.dir=S.depSort.dir==="asc"?"desc":"asc";
+      else S.depSort={col:c,dir:"asc"};
+      renderDeps(el,T);
+    };
+  });
   $("tf").oninput=e=>{S.tfilter=e.target.value;renderDeps(el,T);const f=$("tf");f.focus();f.setSelectionRange(f.value.length,f.value.length);};
 }
 function renderSymbols(el,T){
@@ -640,12 +695,17 @@ function renderSymbols(el,T){
 }
 function renderFlows(el,T){
   const flows=T.flows||[];
-  let h="<h1>Flows</h1><p class='lede'>Ordered evidenced steps — click any step to inspect.</p>";
+  const nCur=flows.filter(f=>f.curated).length;
+  let h="<h1>Flows</h1><p class='lede'>Ordered evidenced steps — click any step to inspect."+
+    (nCur?" "+nCur+" agent-curated flow"+(nCur>1?"s":"")+" first, then tool candidates."
+      :" No curated business-flows/ yet — candidates below need agent review.")+"</p>";
   h+="<div class='toolbar'><input type='text' id='tf' placeholder='Filter flows…' value='"+esc(S.tfilter)+"'></div>";
   const got=filteredRows(flows,f=>f.seed+" "+(f.steps||[]).map(s=>s.label).join(" "));
   if(!got.length) h+=emptyState("flows");
   got.slice(0,100).forEach((f,i)=>{
-    h+="<h2>"+(i+1)+". "+esc(f.seed||"flow")+" <span class='pill "+(f.complete?"HIGH":"LOW")+"'>"+(f.complete?"evidenced":"partial")+"</span></h2>";
+    const tag=f.curated?"curated":"candidate";
+    h+="<h2>"+(i+1)+". "+esc(f.seed||"flow")+" <span class='pill "+(f.complete?"HIGH":"LOW")+"'>"+(f.complete?"evidenced":"partial")+"</span> <span class='pill'>"+tag+"</span>"+
+      (f.source?" <span class='mono' style='font-size:12px;color:var(--faint)'>"+esc(f.source)+"</span>":"")+"</h2>";
     (f.steps||[]).forEach((s,j)=>{
       h+="<div class='step'><span class='i'>"+(j+1)+"</span><span>"+(s.missing?esc(s.id):rowLink(s.id,s.label))+"</span><span class='mono' style='color:var(--faint);font-size:12px'>"+esc(s.kind||"")+"</span><span class='mono' style='margin-left:auto;font-size:12px'>"+srcLink(s.file,s.line)+"</span></div>";
     });
@@ -654,27 +714,53 @@ function renderFlows(el,T){
   el.innerHTML=h; bindLinks(el);
   $("tf").oninput=e=>{S.tfilter=e.target.value;renderFlows(el,T);const f=$("tf");f.focus();f.setSelectionRange(f.value.length,f.value.length);};
 }
+function renderCapabilities(el,T){
+  const caps=T.capabilities||[];
+  let h="<h1>Capabilities</h1><p class='lede'>Capability → requirements → realizing code → why. Intent is <span class='pill ASSERTED'>ASSERTED</span> (human/agent claim with author + source), kept separate from DERIVED scanner evidence below.</p>";
+  h+="<div class='toolbar'><input type='text' id='tf' placeholder='Filter capabilities…' value='"+esc(S.tfilter)+"'></div>";
+  const rows=[];
+  caps.forEach(c=>{(c.requirements||[]).forEach(r=>rows.push({cap:c.title,capId:c.id,req:r}));});
+  const got=filteredRows(rows,r=>r.cap+" "+r.req.title+" "+r.req.status+" "+(r.req.source||""));
+  if(!caps.length) h+="<div class='empty'>No intent imported yet — run <span class='mono'>intent import</span> on docs/requirements.md, plan.md, decisions.md to populate this view. Code structure is unaffected.</div>";
+  else if(!got.length) h+="<div class='empty'>No capabilities match this filter.</div>";
+  got.forEach(({cap,capId,req})=>{
+    const pill=req.status==="realized"?"HIGH":(req.status==="stale"?"MEDIUM":"LOW");
+    h+="<h2>"+esc(cap)+" <span class='mono' style='font-weight:normal'>"+esc(capId)+"</span></h2>";
+    h+="<table class='tv'><tr><th>Requirement</th><th>Status</th><th>Asserted by</th><th>Realizing code</th></tr>";
+    h+="<tr><td>"+esc(req.title)+"<br><span class='mono'>"+esc(req.id)+"</span>"+(req.source?"<br><span class='mono'>"+esc(req.source)+"</span>":"")+"</td>"+
+      "<td><span class='pill "+pill+"'>"+esc(req.status)+"</span> <span class='pill ASSERTED'>ASSERTED</span></td>"+
+      "<td class='mono'>"+esc(req.asserted_by||"—")+(req.asserted_at?"<br>"+esc(req.asserted_at):"")+"</td>"+
+      "<td>"+((req.code||[]).map(c=>rowLink(c.id,(c.label||c.id)+" ("+(c.kind||"?")+")")+ " <span class='mono'>"+srcLink(c.file,c.line)+"</span>"+(c.why?"<br><i>"+esc(c.why)+"</i>":"")).join("<br>")||"—")+"</td></tr></table>";
+  });
+  el.innerHTML=h; bindLinks(el);
+  $("tf").oninput=e=>{S.tfilter=e.target.value;renderCapabilities(el,T);const f=$("tf");f.focus();f.setSelectionRange(f.value.length,f.value.length);};
+}
 function renderIssues(el,T){
   const issues=T.issues||[];
   const sevs=["HIGH","MEDIUM","LOW"];
-  let h="<h1>Issues</h1><p class='lede'>Validate findings + LOW items + unresolved + stale files.</p>";
+  const cats0=[...new Set(issues.map(r=>r.category))].sort();
+  let h="<h1>Issues</h1><p class='lede'>Validation findings, LOW-confidence items, unresolved refs, stale files.</p>";
   h+="<div class='toolbar'><input type='text' id='tf' placeholder='Filter issues…' value='"+esc(S.tfilter)+"'>"+
-    "<select id='sv'><option value=''>all severities</option>"+sevs.map(s=>"<option"+(S.issueSev===s?" selected":"")+">"+s+"</option>").join("")+"</select></div>";
+    "<select id='sv'><option value=''>all severities</option>"+sevs.map(s=>"<option value='"+s+"'"+(S.issueSev===s?" selected":"")+">"+s+"</option>").join("")+"</select>"+
+    "<select id='sc'><option value=''>all categories</option>"+cats0.map(s=>"<option value='"+esc(s)+"'"+(S.issueCat===s?" selected":"")+">"+esc(s)+"</option>").join("")+"</select></div>";
   let rows=issues;
   if(S.issueSev) rows=rows.filter(r=>r.severity===S.issueSev);
+  if(S.issueCat) rows=rows.filter(r=>r.category===S.issueCat);
   rows=filteredRows(rows,r=>r.category+" "+r.message+" "+(r.id||"")+" "+(r.file||""));
   const ds={is:copyOut(0,rows,["severity","category","message","id","file","line"])};
   h+=copyBar("is",rows,["severity","category","message","id","file","line"]);
   const cats={};
   rows.forEach(r=>{cats[r.category]=cats[r.category]||[];cats[r.category].push(r);});
-  if(!rows.length) h+="<div class='empty'>No issues — the map validates cleanly.</div>";
+  if(!rows.length) h+="<div class='empty'>No issues match — the map validates cleanly for this filter.</div>";
   Object.keys(cats).sort().forEach(c=>{
-    h+="<h2>"+esc(c)+" ("+cats[c].length+")</h2><table class='tv'><tr><th>severity</th><th>finding</th><th>subject</th><th>source</th></tr>"+
+    h+="<h2>"+esc(c)+" ("+cats[c].length+")</h2><table class='tv'><tr>"+th("severity","Severity",S.tsort)+th("message","Finding",S.tsort)+th("id","Subject",S.tsort)+th("file","Source",S.tsort)+"</tr>"+
       cats[c].slice(0,300).map(r=>"<tr><td><span class='pill "+esc(r.severity)+"'>"+esc(r.severity)+"</span></td><td>"+esc(r.message)+"</td><td class='mono'>"+(r.id?rowLink(r.id,r.id):"—")+"</td><td class='mono'>"+srcLink(r.file,r.line)+"</td></tr>").join("")+"</table>";
   });
   el.innerHTML=h; bindLinks(el); bindCopy(el,ds);
+  bindSort(el,(r,c)=>r[c],()=>renderIssues(el,T));
   $("tf").oninput=e=>{S.tfilter=e.target.value;renderIssues(el,T);const f=$("tf");f.focus();f.setSelectionRange(f.value.length,f.value.length);};
   $("sv").onchange=e=>{S.issueSev=e.target.value;renderIssues(el,T);};
+  $("sc").onchange=e=>{S.issueCat=e.target.value;renderIssues(el,T);};
 }
 
 /* ---------- filters / legend / stats ---------- */
@@ -742,9 +828,11 @@ function bootFromURL(){
   const p=new URLSearchParams(location.search);
   const b=BOOT.focus||{};
   const v=p.get("view");
-  if(v&&(DATA.views||[]).includes(v)) S.view=v;
+  const VIEWS8=["overview","endpoints","data","dependencies","symbols","flows","capabilities","graph","issues"];
+  if(v&&VIEWS8.includes(v)) S.view=v;
+  else if(v&&(DATA.views||[]).includes(v)) S.view=v;
   else if(v&&EMODE[v]){ S.view="graph"; S.mode=v; }
-  else if(b.flow&&!p.get("node")) S.view="flow";
+  else if(b.flow&&!p.get("node")) S.view="flows";
   else if(b.impact&&!p.get("node")) S.view="graph";
   if(p.get("mode")&&EMODE[p.get("mode")]) S.mode=p.get("mode");
   else if(b.flow&&S.view==="graph") S.mode="flow";
@@ -778,7 +866,7 @@ function bootFromURL(){
 /* ---------- chrome ---------- */
 $("fitbtn").onclick=()=>fitCam();
 $("zfit").onclick=()=>fitCam();
-$("resetbtn").onclick=()=>{S.sel=null;S.edgeSel=null;S.group=null;S.hist=[];S.hi=-1;S.tfilter="";pushHist();setView("overview");syncURL();};
+$("resetbtn").onclick=()=>{S.sel=null;S.edgeSel=null;S.group=null;S.hist=[];S.hi=-1;S.tfilter="";S.tsort=null;S.depSort=null;S.symKind="";S.symLang="";S.symFile="";S.issueSev="";S.issueCat="";S.folded={};Object.keys(GROUPS).forEach(g=>{S.collapsed[g]=true;});pushHist();setView("overview");syncURL();};
 $("zin").onclick=()=>zoom(1.25);
 $("zout").onclick=()=>zoom(1/1.25);
 $("depthsel").onchange=e=>{S.depth=+e.target.value;rebuild();};

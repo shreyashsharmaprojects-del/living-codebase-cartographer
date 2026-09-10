@@ -26,7 +26,10 @@ ROUTER_RE = re.compile(
     r"""\.(?:route|service|nest)\s*\(\s*["']([^"']+)["']""")
 HANDLER_RE = re.compile(
     r"""\.(?:get|post|put|delete|patch)\s*\(\s*([\w:]+)""")
-USE_RE = re.compile(r"^\s*use\s+([\w:{},\s*]+);", re.M)
+# Single-line use lists only: newlines are excluded so one use can never
+# swallow following statements into an "unresolved:module:..." id (mirrors
+# python IMPORT_RE single-line fix; Wave 4 Part 3 item 4 class).
+USE_RE = re.compile(r"^\s*use\s+([\w:{},* \t]+);", re.M)
 # Same-file call detection (mirrors java's same-class HIGH pattern).
 CALL_RE = re.compile(r"\b([A-Za-z_][\w]*)(?:::\s*([A-Za-z_][\w]*))?\s*\("
                      r"|\b([A-Za-z_][\w]*)\s*\.\s*([A-Za-z_][\w]*)\s*\(")
@@ -35,6 +38,7 @@ CALL_KEYWORDS = frozenset({
     "struct", "enum", "impl", "let", "mut", "ref", "move", "in",
     "else", "loop", "vec", "Some", "None", "Ok", "Err", "panic",
 })
+SQL_VERB_RE = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
 SQL_TABLE_RE = re.compile(
     r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 SCHED_RE = re.compile(r"tokio::time::interval|cron::|job_scheduler")
@@ -213,5 +217,16 @@ def scan(ctx, path, text):
         if tbl in ("select", "where", "set", "values", "order", "group"):
             continue
         line = text[:tm.start()].count("\n") + 1
-        ctx.edge(f"file:{rel}", f"table:{tbl}", "reads", line, "LOW",
+        # Verb classification (mirrors python/java/go): the DML verb
+        # decides reads vs writes. The statement's verb is the LAST verb
+        # on the match's line (searching from the file start would pin the
+        # first verb of an unrelated earlier statement).
+        line_start = text.rfind("\n", 0, tm.start()) + 1
+        vm = None
+        for cand in SQL_VERB_RE.finditer(text, line_start, tm.start()):
+            vm = cand
+        etype = "reads" if (vm is None
+                            or vm.group(1).upper() == "SELECT") \
+            else "writes"
+        ctx.edge(f"file:{rel}", f"table:{tbl}", etype, line, "LOW",
                  {"via": "sql-string", "lang": LANG})

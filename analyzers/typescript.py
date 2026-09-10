@@ -28,6 +28,12 @@ HTTP_RE = re.compile(
     r"\.http[ \t]*\.[ \t]*(get|post|put|delete|patch)[ \t]*[<(](?:[^)\n]|\n){0,500}?['\"`](/(?:[^'\"`\n]*))?['\"`]")
 HTTP2_RE = re.compile(
     r"this\.http[ \t]*\.[ \t]*(get|post|put|delete|patch)[ \t]*<[ \t]*[^>\n]{0,200}>[ \t\n]*\([ \t\n]*['\"`]([^'\"`\n]{0,300})['\"`]")
+# `.http.request(method, url)`: the method is the first argument, so it is
+# captured line-locally (single-quoted, double-quoted, or backtick) and the
+# URL capture stays single-line. Non-literal first arguments are handled at
+# the emit site (unknown, never GET).
+HTTP_REQUEST_RE = re.compile(
+    r"\.http[ \t]*\.[ \t]*request[ \t]*\([ \t\n]*['\"`]([A-Za-z]{1,20})['\"`][ \t\n]*,[ \t\n]*['\"`]([^'\"`\n]{0,300})['\"`]")
 FETCH_RE = re.compile(
     r"""\bfetch[ \t]*\([ \t\n]*['"`]([^'"`\n]{0,300})['"`]""")
 # `method: "POST"` inside a fetch options literal. The options window itself
@@ -54,15 +60,20 @@ CONFIG_METHOD_KEY_RE = re.compile(r"""method[ \t]*:""")
 CONFIG_URL_RE = re.compile(r"""url[ \t]*:[ \t]*['"`]([^'"`\n]{0,300})['"`]""")
 # Declarations: exported and plain. Non-exported symbols are still declared
 # symbols, so they get nodes + file defines like exported ones.
+# Optional `: ReturnType` annotations are allowed (and never captured as
+# part of the name): typed methods such as `async load(): Promise<void> {`
+# are declarations, and skipping them leaves call edges dangling.
 EXPORT_DECL_RE = re.compile(
     r"^[ \t]*export[ \t]+(?:default[ \t]+)?(?:abstract[ \t]+)?(?:const[ \t]+)?"
     r"(class|interface|enum|type)[ \t]+(\w+)")
 PLAIN_DECL_RE = re.compile(
     r"^[ \t]*(?:declare[ \t]+|abstract[ \t]+|default[ \t]+)?"
     r"(class|interface|enum)[ \t]+(\w+)")
-CLASS_RE = re.compile(r"export[ \t]+(?:default[ \t]+)?(?:class|function)[ \t]+(\w+)")
+CLASS_RE = re.compile(
+    r"export[ \t]+(?:default[ \t]+)?(?:class|function)[ \t]+(\w+)")
 FUNC_RE = re.compile(
-    r"export[ \t]+(?:async[ \t]+)?function[ \t]+(\w+)|"
+    r"export[ \t]+(?:async[ \t]+)?function[ \t]+(\w+)[ \t]*\("
+    r"(?:[^;{}\n]*\)[ \t]*(?::[^{\n]*)?\{)?|"
     r"(?:const|let|var)[ \t]+(\w+)[ \t]*=[ \t]*(?:async[ \t]+)?\(|"
     r"(?:const|let|var)[ \t]+(\w+)[ \t]*=[ \t]*(?:async[ \t]*)?\(")
 INJECTABLE_RE = re.compile(r"@Injectable")
@@ -83,9 +94,14 @@ ROUTE_LIB_RE = re.compile(
     r"""(?:from[ \t]+['"`](?:react-router(?:-dom)?|vue-router|@angular/router|svelte-routing)['"`])|"""
     r"""(?:createBrowserRouter|createRoutesFromElements|<Route[ \t\n]|useRoutes[ \t]*\()""")
 # Same-file call detection: pass 1 collects defined function/method names.
+# Group 3 (methods) allows an optional `: ReturnType` annotation between the
+# parameter list and the opening brace; without it typed methods such as
+# `protected load(): Promise<void> {` are skipped, their def nodes never
+# emitted, and class-qualified call edges to them dangle (1.4-adjacent:
+# the skipped def is what breaks validate, not the call edge).
 FUNC_DEF_RE = re.compile(
     r"(?:function[ \t]+(\w+)|(?:const|let|var)[ \t]+(\w+)[ \t]*=[ \t]*(?:async[ \t]*)?[\(<]|"
-    r"(?:public|private|protected|static|async|[ \t])*(\w+)[ \t]*\([^;{}\n]*\)[ \t]*\{)")
+    r"(?:public|private|protected|static|async|[ \t])*(\w+)[ \t]*\([^;{}\n]*\)[ \t]*(?::[^{\n]*)?\{)")
 CALL_RE = re.compile(r"\b([A-Za-z_][\w]*)[ \t]*\(")
 CALL_KEYWORDS = frozenset({
     "if", "for", "while", "switch", "catch", "return", "new", "import",
@@ -99,20 +115,51 @@ def can_handle(path, text=None):
         "ts", "tsx", "js", "jsx", "mjs", "cjs") and not path.endswith(".d.ts")
 
 
-def _emit_ts_calls(ctx, src, current_class, body, i, defined, rel):
-    """Emit same-file calls edges for call sites found in `body`."""
+def _emit_ts_calls(ctx, src, current_class, body, i, defined, rel,
+                   _methods=None, _funcs=None):
+    """Emit same-file calls edges for call sites found in `body`.
+
+    Call-side qualification never invents a class home: `this.m()` (or a
+    bare `m()` — TS allows unqualified self-calls) resolves to
+    `<class>#m` only when method `m` is actually defined on the enclosing
+    class (`_methods`); a name that is a module-level function in this
+    file (`_funcs`) resolves to `ts:func:<name>` even from inside a class
+    body (e.g. `withReference(...)` inside service `Toasts`, or bare
+    `coverageScalar(...)` inside `ClaimDetail`). Anything else is an
+    honest unresolved lead (`unresolved:call:<name>`, LOW) — never a
+    HIGH edge to a nonexistent node. Keyword-prefiltered, so only names
+    in `defined` are ever considered. Comment text (`//...`) is stripped
+    before matching: prose such as `proxy error (...)` is not a call.
+    """
     _src_name = (src.rsplit("#", 1)[-1] if "#" in src
                  else src.split(":")[-1])
-    for _cm in CALL_RE.finditer(body):
+    _code = body.split("//", 1)[0]
+    for _cm in CALL_RE.finditer(_code):
         _t = _cm.group(1)
         if _t in CALL_KEYWORDS or _t in ("this", _src_name):
             continue
-        if _t in defined:
+        if _t not in defined:
+            continue
+        _this_call = re.match(
+            r"(?:^|[^\w$])this[ \t]*\.[ \t]*" + re.escape(_t) +
+            r"[ \t]*\($", _code[:_cm.start() + 1].split("\n")[-1]) \
+            is not None
+        if _methods is not None and _funcs is not None:
+            if _t in _methods and (_this_call or _t not in _funcs):
+                _dst = (f"{current_class[1]}#{_t}" if current_class
+                        else f"ts:func:{_t}")
+            elif _t in _funcs:
+                _dst = f"ts:func:{_t}"
+            else:
+                ctx.edge(src, f"unresolved:call:{_t}", "calls", i, "LOW",
+                         {"via": "same-file-unresolved", "lang": LANG})
+                continue
+        else:
             _dst = (f"{current_class[1]}#{_t}" if current_class
                     else f"ts:func:{_t}")
-            if _dst != src:
-                ctx.edge(src, _dst, "calls", i, "HIGH",
-                         {"via": "same-file", "lang": LANG})
+        if _dst != src:
+            ctx.edge(src, _dst, "calls", i, "HIGH",
+                     {"via": "same-file", "lang": LANG})
 
 
 def _method_id_shape_example():
@@ -254,13 +301,21 @@ def _options_method(text, fetch_start):
     # A bare `method` shorthand ({method}) passes a variable through and
     # is unknown. A `method:` key with no string literal (an options
     # object that names method dynamically, e.g. method: m) is unknown.
-    # Otherwise the tail holds no method key at all (headers/body-only
-    # options) and the platform default GET applies.
-    if FETCH_METHOD_SHORT_RE.search(" " + window):
-        return ("unknown", None)
-    if FETCH_METHOD_KEY_RE.search(window):
-        return ("unknown", None)
-    return ("bare", None)
+    # A second argument that is not statically an inline object literal —
+    # an identifier such as `opts`, a member access, or a call result —
+    # may carry a method, so it is unknown, never the GET default. Only a
+    # literal inline object (possibly with generics whitespace) that names
+    # no method key keeps the platform default, as does a bare call.
+    _tail = window.strip()
+    if _tail[:1] == "{":
+        if FETCH_METHOD_SHORT_RE.search(" " + window):
+            return ("unknown", None)
+        if FETCH_METHOD_KEY_RE.search(window):
+            return ("unknown", None)
+        return ("bare", None)
+    if not _tail:
+        return ("bare", None)
+    return ("unknown", None)
 
 
 def _framework_of(text, rel):
@@ -285,13 +340,47 @@ def scan(ctx, path, text):
              {"lang": LANG, "framework": fw,
               "role": "test" if is_spec else "source"})
     lines = text.splitlines()
-    # pass 1: collect defined function/method names (for same-file calls)
+    # pass 1: collect defined function/method names (for same-file calls).
+    # _funcs: names defined as module-level functions (whole-text pre-pass,
+    # so forward references — a call at line 294 to a function defined at
+    # line 398 — still resolve). _methods: names defined as class members
+    # (filled during pass 2, when the authoritative class scope is known).
+    # The call-side qualifier uses these sets so a call target never
+    # invents a class home the def-side never emits (e.g. free
+    # `withReference` called from inside service `Toasts` must resolve to
+    # `ts:func:`, and bare `coverageScalar(...)` inside `ClaimDetail`
+    # likewise). Module-level = line starts at indent 0 and is not a
+    # class member continuation; `export function` / plain `function` at
+    # indent 0 are the free-function shapes (CLASS_RE group(1) doubles as
+    # the function name there, FUNC_DEF_RE group(1) likewise).
     defined = set()
     for _dm in FUNC_DEF_RE.finditer(text):
         for _g in _dm.groups():
             if _g:
                 defined.add(_g)
+    _methods = {}  # class node-id -> set of member names (pass 2)
+    _funcs = set()  # module-level function names (pre-pass)
+    for _pl in text.splitlines():
+        if _pl[:1].isspace() or not _pl.strip():
+            continue
+        _pcm = CLASS_RE.search(_pl)
+        if _pcm and re.search(
+                r"\bfunction[ \t]+" + re.escape(_pcm.group(1)), _pl):
+            _funcs.add(_pcm.group(1))
+            continue
+        _pfd = FUNC_DEF_RE.search(_pl)
+        if _pfd and _pfd.group(1):
+            _funcs.add(_pfd.group(1))
     # pass 2: line scan; track enclosing class + function for call sources
+    # current_class is authoritative for the whole class body (classes are
+    # the only multi-line scope tracked; free functions return to the
+    # enclosing class, never to None). Brace accounting alone cannot delimit
+    # classes: method bodies, object literals, and arrow bodies rebalance
+    # braces, and a decorator line such as `@Component({...})` contributes a
+    # net-zero `{...}` pair that still closes the class early. So class scope
+    # ends ONLY at an explicit `export class X` of a different class, at a
+    # top-level (indent-0, brace-0) non-member statement, or at end of file.
+    # The line-local brace counts below serve single-line bodies only.
     current_class = None   # (name, node-id)
     current_func = None    # node-id of enclosing function/method
     brace_depth = 0        # reset class scope when its block closes
@@ -345,6 +434,10 @@ def scan(ctx, path, text):
         _http_spans.append((hm.start(), hm.end()))
         _emit_consumer(ctx, rel, text[:hm.start()].count("\n") + 1,
                        hm.group(1), hm.group(2), "http")
+    for rm in list(HTTP_REQUEST_RE.finditer(text)):
+        _http_spans.append((rm.start(), rm.end()))
+        _emit_consumer(ctx, rel, text[:rm.start()].count("\n") + 1,
+                       rm.group(1), rm.group(2), "http")
     for am in list(AXIOS_CALL_RE.finditer(text)) + \
             list(HTTP_SHORT_RE.finditer(text)):
         _http_spans.append((am.start(), am.end()))
@@ -419,16 +512,21 @@ def scan(ctx, path, text):
             dec = " ".join(decorators)
             if re.search(r"\bfunction[ \t]+" + re.escape(cname), line):
                 # `export function foo` — a plain function, not a class.
-                # Track as enclosing scope so its call sites link.
+                # Track as enclosing scope so its call sites link. A
+                # module-level function also closes any open class scope
+                # (it cannot be a class member) and registers in _funcs
+                # so callers inside a class body resolve `ts:func:foo`.
                 current_class = None
                 current_func = f"ts:func:{cname}"
                 _declare(current_func, "function", cname, i, "HIGH",
                          {"lang": LANG, "framework": fw})
+                _funcs.add(cname)
                 decorators = []
                 # calls on the definition line itself (one-liner bodies)
                 if "{" in line:
                     _emit_ts_calls(ctx, current_func, None,
-                                   line.split("{", 1)[1], i, defined, rel)
+                                   line.split("{", 1)[1], i, defined, rel,
+                                   None, _funcs)
                 continue
             if COMPONENT_RE.search(dec):
                 nkind, nid = "component", f"ts:component:{cname}"
@@ -522,7 +620,12 @@ def scan(ctx, path, text):
             _http_spans.append((_abs, _abs + hm.end() - hm.start()))
             _emit_consumer(ctx, rel, i, hm.group(1), hm.group(2), "http")
         # same-file calls: enclosing scope -> defined function (HIGH).
-        # add_node/add_edge dedupe by id, so re-emitting is safe.
+        # Class->method and file->symbol defines are HIGH declarations per
+        # the shared conventions (method node id ts:class:<Class>#<method>).
+        # add_node/add_edge dedupe by id, so re-emitting is safe. Member
+        # definitions bind to the authoritative current_class: the call
+        # edge and the def node share the identical id, so call targets
+        # never dangle while their class scope is open.
         _fd = FUNC_DEF_RE.search(line)
         if _fd:
             _fname = _fd.group(1) or _fd.group(2) or _fd.group(3)
@@ -531,29 +634,67 @@ def scan(ctx, path, text):
                 if current_class:
                     current_func = f"{current_class[1]}#{_fname}"
                     ctx.node(current_func, "method", _fname, i,
-                             "MEDIUM",
+                             "HIGH",
                              {"lang": LANG, "via": "member-function"})
                     ctx.edge(current_class[1], current_func,
-                             "defines", i, "MEDIUM", {"lang": LANG})
-                    declared.setdefault(current_func, (i, "MEDIUM"))
+                             "defines", i, "HIGH", {"lang": LANG})
+                    declared.setdefault(current_func, (i, "HIGH"))
+                    _methods.setdefault(current_class[1], set()).add(_fname)
                 elif not current_func or not current_func.endswith(
                         f":{_fname}"):
                     current_func = f"ts:func:{_fname}"
                     _declare(current_func, "function", _fname, i,
-                             "MEDIUM", {"lang": LANG})
-                # calls on the definition line itself (one-liner bodies)
+                             "HIGH", {"lang": LANG})
+                    _funcs.add(_fname)
+                else:
+                    # Re-declared while already scoped (e.g. a module-level
+                    # function after a class when scope did not close):
+                    # still a free function for call resolution.
+                    _funcs.add(_fname)
+                # calls on the definition line itself (one-liner bodies).
+                # Only the text AFTER the signature's opening brace is the
+                # body: splitting on the first "{" of the line misfires when
+                # the line starts with decorators/generics or a parameter
+                # default containing "{" (object literal, `= {`). The body
+                # starts at the brace that closes the parameter list, i.e.
+                # the first "{" at or after the matched definition.
                 if "{" in line:
+                    _body_from = line.find(
+                        "{", _fd.start() + len(_fd.group(0).rstrip("{ ")))
+                    if _body_from < 0:
+                        _body_from = line.find("{")
                     _emit_ts_calls(ctx, current_func, current_class,
-                                   line.split("{", 1)[1], i, defined, rel)
+                                   line[_body_from + 1:], i, defined, rel,
+                                   _methods.get(current_class[1])
+                                   if current_class else None, _funcs)
                 brace_depth += line.count("{") - line.count("}")
                 continue
         if current_func and "(" in line \
                 and not stripped.startswith(("import ", "export ")):
             _emit_ts_calls(ctx, current_func, current_class, line,
-                           i, defined, rel)
+                           i, defined, rel,
+                           _methods.get(current_class[1])
+                           if current_class else None, _funcs)
         brace_depth += line.count("{") - line.count("}")
-        if current_class and class_depth is not None \
-                and brace_depth <= class_depth and "}" in line:
+        # Class scope ends at end of file or at a top-level non-member
+        # statement — never on brace counts (method bodies and object
+        # literals rebalance braces; decorator argument lists such as
+        # `@Component({...})` are net-zero but still corrupt a
+        # brace-derived class window). Top-level = no indent and no open
+        # block: such a line cannot be a class member continuation.
+        # Module-level `function` declarations (plain or `export`) always
+        # close class scope and register in _funcs; the `export function`
+        # branch above already did this via CLASS_RE, so only the plain
+        # `function foo(` form needs handling here.
+        _is_mod_func = _fd is not None and _fd.group(1) \
+            and not line[:1].isspace() \
+            and not re.search(r"\bfunction[ \t]+\w+[ \t]*\(",
+                              line[:_fd.start()])
+        _at_top = brace_depth <= 0 and not line[:1].isspace() \
+            and bool(stripped)
+        if current_class and (_is_mod_func or (_at_top and _fd is None
+                and not stripped.startswith("@")
+                and not stripped.startswith(("export ", "import ")))):
             current_class = None
             current_func = None
             class_depth = None

@@ -44,8 +44,13 @@ FIELD_DECL_RE = re.compile(
 NEW_RE = re.compile(r"\bnew\s+([A-Z][\w]*)\s*\(")
 FIELD_INJECT_RE = re.compile(
     r"^\s*private\s+(?:final\s+)?([A-Z][\w<>]*)\s+\w+\s*[;=]")
-TABLE_RE = re.compile(r'@Table\s*\(\s*name\s*=\s*"([^"]+)"')
+# Order-independent: name= may follow schema=/catalog=, and the value may
+# sit on a continuation line (pre_annotations accumulates those while the
+# paren depth is open). \s may span the newline inside this paren-bounded
+# annotation buffer only — never inside a repeated char class (1.4).
+TABLE_RE = re.compile(r'@Table\b\s*\(\s*[^)]*?name\s*=\s*"([^"]+)"')
 REPO_RE = re.compile(r"interface\s+(\w+)\s+extends\s+JpaRepository\s*<\s*(\w+)")
+SQL_VERB_RE = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
 SQL_TABLE_RE = re.compile(
     r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 SEQ_RE = re.compile(r"nextval\s*\(\s*'([^']+)'")
@@ -191,6 +196,13 @@ def scan(ctx, path, text):
             table_name = table.group(1).lower() if table else None
             if table_name:
                 meta["table"] = table.group(1)
+            elif "Entity" in stereotypes:
+                # Bare @Entity: JPA defaults the table name to the entity
+                # (unqualified class) name. LOW-confidence table node +
+                # edges keep the ORM path visible instead of dropping it.
+                table_name = cls.lower()
+                meta["table"] = cls
+                meta["table_default"] = True
             node_kind = ("controller" if "RestController" in stereotypes or
                          "Controller" in stereotypes
                          else "service" if "Service" in stereotypes
@@ -205,18 +217,19 @@ def scan(ctx, path, text):
             ctx.node(cls_id(cls), node_kind, cls, i, "HIGH", meta)
             ctx.edge(f"file:{rel}", cls_id(cls), "defines", i, "HIGH", {})
             if "Entity" in stereotypes and table_name:
-                # JPA entity <-> table: the class maps its rows, so it both
-                # reads (loads) and writes (persists) that table.
+                # JPA entity <-> table: the annotation declares a MAPPING,
+                # not an access. A mapping is not evidence of a read or a
+                # write, so a single mapping edge keeps degree and reverse
+                # lookups honest (reads/writes come only from real SQL or
+                # repository access sites, never from the declaration).
+                is_default = meta.get("table_default", False)
+                tconf = "LOW" if is_default else "HIGH"
                 tid = f"table:{table_name}"
-                ctx.node(tid, "table", table_name, i, "HIGH",
+                ctx.node(tid, "table", table_name, i, tconf,
                          {"lang": LANG, "via": "jpa-entity",
                           "model": cls})
-                ctx.edge(f"file:{rel}", tid, "defines", i, "HIGH", {})
-                ctx.edge(cls_id(cls), tid, "reads", i, "MEDIUM",
-                         {"via": "jpa-entity", "lang": LANG})
-                ctx.edge(cls_id(cls), tid, "writes", i, "MEDIUM",
-                         {"via": "jpa-entity", "lang": LANG})
-                ctx.edge(cls_id(cls), tid, "queries", i, "LOW",
+                ctx.edge(f"file:{rel}", tid, "defines", i, tconf, {})
+                ctx.edge(cls_id(cls), tid, "maps-to", i, tconf,
                          {"via": "jpa-entity", "lang": LANG})
             for ster in stereotypes:
                 if ster in ("Service", "Component", "Repository",
@@ -232,10 +245,15 @@ def scan(ctx, path, text):
                 lines[i] if i < len(lines) else ""))
             if repo_m:
                 ent = repo_m.group(2)
+                ent_tid = f"table:{ent.lower()}"
                 ctx.edge(cls_id(cls), f"entity:{ent}", "reads", i,
                          "HIGH", {"via": "JpaRepository", "lang": LANG})
                 ctx.edge(cls_id(cls), f"entity:{ent}", "writes", i,
                          "MEDIUM", {"via": "JpaRepository", "lang": LANG})
+                ctx.edge(cls_id(cls), f"entity:{ent}", "queries", i,
+                         "MEDIUM", {"via": "JpaRepository", "lang": LANG})
+                ctx.edge(cls_id(cls), ent_tid, "reads", i,
+                         "LOW", {"via": "JpaRepository-table", "lang": LANG})
             pre_annotations = []
             continue
         if cls is None:
@@ -305,6 +323,7 @@ def scan(ctx, path, text):
                 ctx.node(eid, "endpoint", f"{http} {full}", mline,
                          "HIGH", {"lang": LANG, "framework": "spring",
                                   "handler": mid, "controller": cls})
+                ctx.edge(f"file:{rel}", eid, "defines", mline, "HIGH", {})
                 ctx.edge(eid, mid, "handled-by", mline, "HIGH", {})
                 pending_mapping = None
             sched = SCHED_RE.search(stripped)
@@ -363,11 +382,20 @@ def scan(ctx, path, text):
         if ('"' in line or "'" in line) and re.search(
                 r"(?i)\b(select|insert|update|delete|from|join|nextval)\b", line):
             edge_src = method_id(cls, current_method) if current_method else cls_id(cls)
+            # Verb classification (mirrors python's _sql_literal_edges):
+            # the DML verb on the line decides the edge type, so "what
+            # mutates this table" stays answerable. SELECT -> reads,
+            # INSERT/UPDATE/DELETE -> writes. No verb -> reads (legacy
+            # default for bare FROM/JOIN fragments).
+            vm = SQL_VERB_RE.search(line)
+            etype = "reads" if (vm is None
+                                or vm.group(1).upper() == "SELECT") \
+                else "writes"
             for tm in SQL_TABLE_RE.finditer(line):
                 tbl = tm.group(1).lower()
                 if tbl in ("select", "where", "set", "values", "order", "group"):
                     continue
-                ctx.edge(edge_src, f"table:{tbl}", "reads", i, "MEDIUM",
+                ctx.edge(edge_src, f"table:{tbl}", etype, i, "MEDIUM",
                          {"via": "jdbc", "lang": LANG})
             for sm in SEQ_RE.finditer(line):
                 ctx.edge(edge_src, f"sequence:{sm.group(1)}", "invokes",
