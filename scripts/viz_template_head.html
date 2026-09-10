@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>__TITLE__</title>
+<!--
+  Living Codebase Cartographer — visualization (read-only VIEW).
+  Generated from .codebase-map/graph.json. No network calls, no telemetry,
+  no external dependencies. Open via file:// or any static server.
+  Regenerate with: cartographer.py visualize
+-->
+<style>
+:root{
+  --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#2b3342;
+  --fg:#e6edf3; --dim:#8b949e; --faint:#5b6572;
+  --accent:#58a6ff; --accent2:#7ee787;
+  --danger:#f85149; --warn:#d29922;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:13px}
+#app{display:flex;flex-direction:column;height:100vh}
+/* ---- top bar ---- */
+#topbar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+#topbar .brand{font-weight:650;font-size:13px;white-space:nowrap}
+#topbar .brand span{color:var(--dim);font-weight:400}
+#search{flex:1;min-width:160px;max-width:420px;position:relative}
+#search input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:6px 8px;font-size:13px;font-family:var(--sans)}
+#search input:focus{outline:none;border-color:var(--accent)}
+#results{position:absolute;top:110%;left:0;right:0;background:var(--panel2);border:1px solid var(--border);border-radius:6px;max-height:300px;overflow:auto;z-index:50;display:none}
+#results .r{padding:6px 8px;cursor:pointer;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:baseline}
+#results .r:hover,#results .r.cur{background:#223049}
+#results .rk{font-family:var(--mono);font-size:12px;color:var(--accent);white-space:nowrap}
+#results .rf{font-family:var(--mono);font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#views{display:flex;gap:4px;flex-wrap:wrap}
+#views button{background:transparent;border:1px solid transparent;color:var(--dim);border-radius:6px;padding:4px 8px;cursor:pointer;font-size:13px;font-family:var(--sans)}
+#views button:hover{color:var(--fg)}
+#views button.on{background:#223049;color:var(--fg);border-color:var(--accent)}
+#gmodes{display:flex;gap:4px;flex-wrap:wrap}
+#gmodes button{background:transparent;border:1px solid transparent;color:var(--dim);border-radius:6px;padding:4px 8px;cursor:pointer;font-size:12px;font-family:var(--sans)}
+#gmodes button:hover{color:var(--fg)}
+#gmodes button.on{background:#223049;color:var(--fg);border-color:var(--border)}
+.btn{background:var(--panel2);border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:4px 8px;cursor:pointer;font-size:12px;font-family:var(--sans)}
+.btn:hover{border-color:var(--accent)}
+.btn:disabled{opacity:.45;cursor:default}
+/* ---- cap banner ---- */
+#banner{display:none;background:#12283f;color:#9ecbff;text-align:center;font-size:12px;padding:4px 8px;border-bottom:1px solid var(--border)}
+#banner.show{display:block}
+#banner button{margin-left:8px}
+/* ---- main ---- */
+#main{flex:1;display:flex;min-height:0}
+#left{width:228px;min-width:228px;background:var(--panel);border-right:1px solid var(--border);overflow:auto;padding:12px;display:flex;flex-direction:column;gap:12px}
+#wrap{flex:1;position:relative;min-width:0;display:flex;flex-direction:column}
+#graphpane{flex:1;position:relative;min-height:0}
+#cv{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab}
+#crumbs{position:absolute;top:8px;left:12px;display:flex;gap:4px;align-items:center;font-size:12px;color:var(--dim);z-index:5;flex-wrap:wrap;max-width:76%}
+#crumbs b{color:var(--fg);font-weight:600}
+#crumbs .c{background:rgba(22,27,34,.9);border:1px solid var(--border);border-radius:4px;padding:4px 8px;cursor:pointer}
+#crumbs .c:hover{border-color:var(--accent)}
+#crumbs .navbtn{font-family:var(--mono)}
+#zoomctl{position:absolute;right:12px;bottom:12px;display:flex;flex-direction:column;gap:4px;z-index:5}
+#zoomctl button{width:32px;height:32px;background:rgba(22,27,34,.92);border:1px solid var(--border);color:var(--fg);border-radius:6px;cursor:pointer;font-size:15px;line-height:1}
+#zoomctl button:hover{border-color:var(--accent)}
+#legend{position:absolute;left:12px;bottom:12px;background:rgba(22,27,34,.92);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:12px;color:var(--dim);z-index:5;max-width:280px}
+#legend .row{display:flex;align-items:center;gap:8px;margin:4px 0}
+#legend svg{flex:none}
+#stalebar{position:absolute;top:0;left:0;right:0;background:#3d2b00;color:#f0c674;text-align:center;font-size:12px;padding:4px;z-index:6;display:none}
+#flowwarn{position:absolute;top:28px;left:0;right:0;text-align:center;font-size:12px;color:var(--warn);z-index:6;display:none}
+#edgepop{position:absolute;display:none;background:var(--panel2);border:1px solid var(--accent);border-radius:6px;padding:8px 12px;font-size:12px;z-index:7;max-width:320px;pointer-events:none}
+#veil{position:absolute;inset:0;background:rgba(13,17,23,.72);display:none;align-items:center;justify-content:center;flex-direction:column;gap:12px;z-index:8;font-size:13px;color:var(--dim)}
+#veil.show{display:flex}
+#veil .spin{width:28px;height:28px;border-radius:50%;border:3px solid var(--border);border-top-color:var(--accent);animation:vspin .8s linear infinite}
+@keyframes vspin{to{transform:rotate(360deg)}}
+/* ---- table pane (structured views) ---- */
+#tablepane{flex:1;overflow:auto;padding:16px 20px;display:none;min-height:0}
+#tablepane.show{display:block}
+#tablepane h1{font-size:20px;margin:0 0 4px;font-weight:650}
+#tablepane h2{font-size:15px;margin:20px 0 8px;font-weight:650;border-bottom:1px solid var(--border);padding-bottom:4px}
+#tablepane .lede{color:var(--dim);font-size:13px;margin:0 0 12px}
+.toolbar{display:flex;gap:8px;align-items:center;margin:12px 0;flex-wrap:wrap}
+.toolbar input[type=text],.toolbar select{background:var(--bg);border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:4px 8px;font-size:12px;font-family:var(--sans)}
+.toolbar input[type=text]{min-width:220px}
+table.tv{width:100%;border-collapse:collapse;font-size:12px;margin:8px 0 16px}
+table.tv th{text-align:left;font-size:12px;color:var(--dim);font-weight:600;padding:4px 8px;border-bottom:1px solid var(--border);cursor:pointer;white-space:nowrap;user-select:none}
+table.tv th:hover{color:var(--fg)}
+table.tv td{padding:4px 8px;border-bottom:1px solid #222a36;vertical-align:top;word-break:break-word}
+table.tv tr:hover td{background:#161e2a}
+table.tv td.mono{font-family:var(--mono)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin:12px 0}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px 12px}
+.card .n{font-size:20px;font-weight:650;font-family:var(--mono)}
+.card .l{font-size:12px;color:var(--dim)}
+.chip{display:inline-block;padding:0 8px;border-radius:12px;font-size:12px;border:1px solid var(--border);margin:0 4px 4px 0;cursor:pointer}
+.chip.on{border-color:var(--accent);color:var(--fg)}
+.pill{display:inline-block;padding:0 8px;border-radius:12px;font-size:12px;border:1px solid var(--border)}
+.pill.HIGH{color:#7ee787;border-color:#2a5a35}
+.pill.MEDIUM{color:#9fb3c8}.pill.LOW{color:#8b949e;border-style:dashed}
+.pill.UNKNOWN{color:#5b6572;border-style:dashed}
+.step{display:flex;gap:8px;align-items:baseline;padding:4px 0;border-bottom:1px solid #222a36;font-size:12px}
+.step .i{font-family:var(--mono);color:var(--faint);min-width:24px}
+.manifest{font-family:var(--mono);font-size:12px;color:var(--accent);margin:12px 0 4px}
+/* ---- inspector ---- */
+#right{width:330px;min-width:330px;background:var(--panel);border-left:1px solid var(--border);overflow:auto;padding:0;text-align:left}
+#insp{padding:12px}
+#insp.selhead h2{background:#12325a;border:1px solid var(--accent);border-radius:6px;padding:8px 12px}
+#insp h2{font-size:15px;margin:0 0 4px;word-break:break-word}
+#insp .sub{font-family:var(--mono);font-size:12px;color:var(--dim);margin-bottom:8px;word-break:break-all}
+.kv{display:flex;gap:8px;padding:4px 0;font-size:13px}
+.kv .k{color:var(--dim);min-width:96px;flex:none}
+.kv .v{word-break:break-word}
+.kv .v.mono{font-family:var(--mono);font-size:12px}
+.conf{display:inline-block;padding:0 8px;border-radius:12px;font-size:12px;font-weight:650;border:1px solid var(--border)}
+.conf.HIGH{color:#7ee787;border-color:#2a5a35}
+.conf.MEDIUM{color:#9fb3c8}.conf.LOW{color:#8b949e;border-style:dashed}
+.conf.UNKNOWN{color:#5b6572;border-style:dashed}
+#insp h3{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:16px 0 8px;border-bottom:1px solid var(--border);padding-bottom:4px}
+.rel{padding:4px 0;border-bottom:1px solid #222a36;font-size:13px;display:flex;gap:8px;align-items:baseline}
+.rel .t{font-family:var(--mono);font-size:12px;color:var(--accent);white-space:nowrap}
+.rel .n{cursor:pointer;color:var(--fg)}
+.rel .n:hover{text-decoration:underline}
+.rel .c{font-size:12px;color:var(--faint);margin-left:auto;flex:none}
+.src{font-family:var(--mono);font-size:12px;color:var(--accent);text-decoration:none;word-break:break-all}
+.src:hover{text-decoration:underline}
+.empty{color:var(--faint);font-size:13px;padding:20px 12px;text-align:center;line-height:1.8}
+.errbar{background:#3d1113;color:#ffa198;font-size:12px;padding:8px 12px;border-radius:6px;margin:8px 0}
+/* ---- filter panel ---- */
+.fsec h4{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}
+.fsec{margin-bottom:4px}
+.chk{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;cursor:pointer}
+.chk input{accent-color:var(--accent)}
+.chk .n{margin-left:auto;color:var(--faint);font-size:12px;font-family:var(--mono)}
+.sw{width:24px;height:12px;border-radius:2px;flex:none;border:1px solid var(--border)}
+#depthsel{background:var(--bg);border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:4px 8px;font-size:13px;width:100%}
+#statline{font-size:12px;color:var(--dim);font-family:var(--mono)}
+kbd{background:var(--panel2);border:1px solid var(--border);border-radius:4px;padding:0 4px;font-family:var(--mono);font-size:12px}
+/* ---- help overlay ---- */
+#help{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:100}
+#help.show{display:flex}
+#help .box{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:20px 24px;max-width:440px;font-size:13px;line-height:2}
+#help h2{font-size:15px;margin:0 0 8px}
+@media (max-width:1100px){#left{display:none}#right{width:280px;min-width:280px}}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <div class="brand">Cartographer <span id="mapline"></span></div>
+    <div id="search"><input id="q" type="text" placeholder="Search nodes — name, kind, file, endpoint…  ( / )" autocomplete="off" spellcheck="false"><div id="results"></div></div>
+    <nav id="views" aria-label="Primary views"></nav>
+    <div id="gmodes" role="tablist" title="Graph lens"></div>
+    <button class="btn" id="fitbtn" title="Fit graph (F)">Fit</button>
+    <button class="btn" id="resetbtn" title="Reset view">Reset</button>
+    <button class="btn" id="exportbtn" title="Export current view as SVG">SVG</button>
+    <button class="btn" id="helpbtn" title="Keyboard shortcuts (?)">?</button>
+  </div>
+  <div id="banner"></div>
+  <div id="main">
+    <div id="left">
+      <div class="fsec"><h4>Confidence</h4><div id="fconf"></div>
+        <div style="font-size:12px;color:var(--faint);margin-top:4px">LOW/UNKNOWN are leads, never confirmed architecture.</div></div>
+      <div class="fsec"><h4>Relationship types</h4><div id="fetypes"></div></div>
+      <div class="fsec"><h4>Node kinds</h4><div id="fkinds"></div></div>
+      <div class="fsec"><h4>Language</h4><div id="flangs"></div></div>
+      <div class="fsec"><h4>Focus depth</h4><select id="depthsel"><option value="1">Depth 1 — direct only</option><option value="2" selected>Depth 2</option><option value="3">Depth 3</option><option value="4">Depth 4</option></select></div>
+      <div class="fsec"><h4>View</h4><div id="statline"></div>
+        <div style="font-size:12px;color:var(--dim);margin-top:8px;line-height:2"><kbd>/</kbd> search &nbsp;<kbd>?</kbd> shortcuts<br><kbd>F</kbd> fit &nbsp;<kbd>+</kbd>/<kbd>−</kbd> zoom<br>click: inspect · edge: details<br>[ / ]: back / forward</div></div>
+    </div>
+    <div id="wrap">
+      <div id="tablepane" aria-live="polite"></div>
+      <div id="graphpane">
+        <div id="stalebar"></div>
+        <div id="flowwarn"></div>
+        <div id="veil"><div class="spin"></div><div id="veilmsg">Laying out graph…</div></div>
+        <canvas id="cv"></canvas>
+        <div id="crumbs"></div>
+        <div id="edgepop"></div>
+        <div id="legend"></div>
+        <div id="zoomctl"><button id="zin" title="Zoom in">+</button><button id="zout" title="Zoom out">−</button><button id="zfit" title="Fit (F)">⤢</button></div>
+      </div>
+    </div>
+    <div id="right"><div id="insp"></div></div>
+  </div>
+</div>
+<div id="help"><div class="box"><h2>Keyboard shortcuts</h2>
+<div><kbd>/</kbd> search &nbsp; <kbd>↑</kbd><kbd>↓</kbd> move &nbsp; <kbd>Enter</kbd> open</div>
+<div><kbd>Esc</kbd> clear selection / close &nbsp; <kbd>F</kbd> fit &nbsp; <kbd>+</kbd> <kbd>−</kbd> zoom</div>
+<div><kbd>[</kbd> back &nbsp; <kbd>]</kbd> forward &nbsp; <kbd>?</kbd> this overlay</div>
+<div style="margin-top:8px"><button class="btn" id="helpclose">Close</button></div>
+</div></div>
+<script>
+"use strict";
+/* __GRAPH_DATA__ */
+</script>
+<script>
+"use strict";
+/* ============================================================
+   Cartographer viewer — canvas graph explorer (no dependencies).
+   DATA comes from the generated window.__CARTO_GRAPH__ view model.
+   BOOT (mode/focus/freshness) comes from window.__CARTO_BOOT__.
+   Part 1: state + visual encodings (shape=kind, dash=confidence,
+   color reserved for layer + selection only).
+   ============================================================ */
+const DATA = window.__CARTO_GRAPH__;
+const BOOT = window.__CARTO_BOOT__ || {};
+const $ = id => document.getElementById(id);
+
+/* ---------- state ---------- */
+const S = {
+  view: "overview",
+  mode: "architecture",
+  conf: {HIGH:true, MEDIUM:true, LOW:false, UNKNOWN:false},
+  etypes: {},   // type -> on/off (built from data)
+  kinds: {},    // kind -> on/off
+  langs: {},    // lang -> on/off
+  sel: null,        // selected node id
+  edgeSel: null,    // selected edge {s,t,type}
+  hover: null,
+  hoverPath: null,  // {nodes:Set, edges:Set} full in/out paths of hover
+  group: null,      // drilled-in group id (architecture mode)
+  depth: 2,
+  collapsed: {},    // group id -> true (module containers, start collapsed)
+  cam: {x:0, y:0, k:1},
+  nodes: [], edges: [],       // current laid-out view
+  byId: {}, adj: {}, inadj: {},
+  crumbs: [],
+  hist: [], hi: -1,           // breadcrumb back/forward history
+  truncated: null,            // {shown,total} when capped at 300
+  tfilter: "",                // table text filter
+  tsort: null,                // {col,dir}
+  symKind: "", symLang: "", symFile: "",
+  issueSev: "",
+};
+const CONF_STYLE = {
+  HIGH:    {w:1.6, dash:[],      a:0.85},
+  MEDIUM:  {w:1.2, dash:[],      a:0.55},
+  LOW:     {w:1.0, dash:[5,4],   a:0.38},
+  UNKNOWN: {w:1.0, dash:[2,4],   a:0.22},
+};
+/* layer palette — the ONLY categorical node color (muted, sparing) */
+const LAYERS = DATA.layers || ["clients","endpoints","handlers","services","data-access","stores"];
+const LAYER_COLOR = {
+  "clients": "#8b9eb5", "endpoints": "#58a6ff", "handlers": "#7ee787",
+  "services": "#9fb3c8", "data-access": "#d29922", "stores": "#bb80ff",
+};
+/* shape per kind family — shape+label, never color alone */
+function kindGlyph(kind){
+  if(kind==="__group__") return "hex";
+  switch(kind){
+    case "service": case "controller": case "handler": return "sq";
+    case "endpoint": case "route": return "dia";
+    case "table": case "view": case "collection": case "database": return "cyl";
+    case "external-service": case "deployment-unit": return "oct";
+    case "queue": case "topic": case "event": return "tri";
+    case "class": case "interface": case "enum": return "rsq";
+    case "component": case "guard": case "interceptor": return "cir";
+    case "test": case "test-case": return "x";
+    case "configuration": case "configuration-key": case "environment": return "dot";
+    case "migration": case "ci-job": case "job": case "schedule": return "flag";
+    default: return "cir";
+  }
+}
+function layerColor(n){
+  if(!n) return "#8b949e";
+  if(n.kind==="__group__") return "#8b949e";
+  return LAYER_COLOR[n.layer] || "#8b949e";
+}
+function kindColor(kind){
+  // legacy alias (kept for SVG export): kind hue only, layer is canonical
+  const P = {endpoint:"#58a6ff", route:"#58a6ff", service:"#7ee787",
+    controller:"#7ee787", handler:"#7ee787", component:"#7ee787",
+    table:"#d29922", view:"#d29922", collection:"#d29922", database:"#d29922",
+    "external-service":"#f778ba", "deployment-unit":"#f778ba",
+    queue:"#bb80ff", topic:"#bb80ff", event:"#bb80ff",
+    class:"#9fb3c8", interface:"#9fb3c8", method:"#6e7681", function:"#6e7681",
+    migration:"#3fb950", "test":"#6e7681", "test-case":"#6e7681"};
+  return P[kind] || "#8b949e";
+}
+</script>
+</body>
+</html>
