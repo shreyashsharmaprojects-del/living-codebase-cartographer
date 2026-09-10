@@ -82,6 +82,56 @@ python3 .dsh/skills/living-codebase-cartographer/scripts/cartographer.py visuali
 Other commands: `validate` (integrity + schema conformance), `detect`
 (evidence-based stack report).
 
+## Intent layer — why does this code exist?
+
+The map answers "what is there"; the intent layer answers "**why** is it
+there". `docs/requirements.md`, `docs/plan.md`, and `docs/decisions.md`
+are parsed into ASSERTED intent nodes — capabilities, requirements,
+concepts, slices, decisions, non-goals — visually tagged `[ASSERTED]` to
+separate human claims from code-derived facts. Code is then bound to the
+intent it realizes, so any symbol resolves to the requirement that asked
+for it:
+
+```bash
+# Parse docs/*.md into intent nodes (idempotent, docs stay authoritative)
+python3 .../cartographer.py intent import
+
+# Attach code to intent: which symbols realize which requirement, in which slice, and why
+python3 .../cartographer.py intent bind --slice "Slice 1" --realizes REQ-001 \
+  --nodes py:function:create_claim py:function:persist_claim \
+  --why "FNOL submit path" --declares-files api/claims.py service/claims.py
+
+# Reverse lookup: what claims this code?
+python3 .../cartographer.py why ClaimService
+
+# Forward lookup: everything realizing a requirement?
+python3 .../cartographer.py responsible-for REQ-001
+```
+
+Notes:
+
+- `--nodes` accepts space-separated ids, comma-separated ids, or repeated
+  `--nodes` flags — all spellings bind the union.
+- `--declares-files` records the *pre-implementation* file declaration
+  (what a slice meant to touch, stated before the code exists) verbatim on
+  the binding; re-binding without it preserves the stored declaration.
+- `REQ-001` / `SLICE-1` style short forms are resolvable aliases — the real
+  node ids are slugified (`intent:requirement:flow-1-1-req-001-...`), so use
+  the full id when scripting against `graph.json`. Tagging a criterion
+  `[REQ-NNN]` keeps its id stable across rewording; untagged criteria re-key
+  when their text changes.
+- Bindings go `needs-review` when bound code changes — `sync` surfaces the
+  drift instead of silently accumulating it.
+
+## Release integrity
+
+`RELEASE.json` ships inside every packaged release with `built_by`,
+`graph_version`, `built_at`, and `tree_hash` (a hash of the shipped file
+set). Anyone can verify a release by recomputing the hash over the unpacked
+content (minus `RELEASE.json`) — a re-tar or tampered copy won't match.
+`package.sh` also runs both suites against the unpacked archive before it
+finishes, so a shipped release has demonstrably passed its own tests.
+
 ## Layout
 
 ```
@@ -110,7 +160,7 @@ living-codebase-cartographer/
 Run the suites before publishing or after any analyzer change:
 
 ```bash
-python3 tests/run_tests.py        # 258 checks
+python3 tests/run_tests.py        # 289 checks
 python3 tests/run_viz_tests.py    # 130 checks
 ```
 
@@ -161,6 +211,11 @@ with left-to-right layered layout, confidence-encoded edges, and editor deep-lin
 Yes — `impact <Symbol>` computes reverse-reachability (callers, consumers,
 entry points) before you change code; `flow --from A --to B` traces request
 paths from frontend through API, logic, and data layers.
+
+**A "why does this code exist" tracker?**
+Yes — the intent layer (`intent import` / `intent bind` / `why` /
+`responsible-for`) binds every symbol to the requirement that asked for it,
+with the reason recorded at the moment of creation. See "Intent layer" above.
 
 **Which languages are supported?**
 Java, TypeScript/JavaScript (incl. React/Vue patterns), Python
